@@ -243,12 +243,12 @@ export function useMentions(
 
     const addCandidate = (candidate: MentionCandidate & { pubkey: string }) => {
       const pubkey = normalizePubkey(candidate.pubkey);
-      if (isArchivedDiscovery(pubkey)) {
-        return;
-      }
-      if (!isAgentIdentityInManagedList(candidate, managedAgentPubkeys)) {
-        return;
-      }
+      if (isArchivedDiscovery(pubkey)) return;
+      const isManaged = isAgentIdentityInManagedList(
+        candidate,
+        managedAgentPubkeys,
+      );
+      if (candidate.isMember !== true && !isManaged) return;
       if (
         shouldHideAgentFromMentions({
           isAgent: candidate.isAgent === true,
