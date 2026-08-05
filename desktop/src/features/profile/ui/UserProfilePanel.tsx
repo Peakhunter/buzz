@@ -281,15 +281,14 @@ export function UserProfilePanel({
   const relayAgent = relayAgentsQuery.data?.find(
     (agent) => agent.pubkey.toLowerCase() === pubkeyLower,
   );
+  const profileSummary = usersBatchQuery.data?.profiles[pubkeyLower];
   const managedAgentLogQuery = useManagedAgentLogQuery(
     (view === "diagnostics" || view === "logs") &&
       managedAgent?.backend.type === "local"
       ? managedAgent.pubkey
       : null,
   );
-  const isAgentByOaOwner = Boolean(
-    usersBatchQuery.data?.profiles[pubkeyLower]?.isAgent,
-  );
+  const isAgentByOaOwner = Boolean(profileSummary?.isAgent);
   const isBot =
     Boolean(relayAgent || managedAgent || resolvedPersona) || isAgentByOaOwner;
   const managedAgentOwner = useIsManagedAgent(isBot ? effectivePubkey : null);
@@ -361,8 +360,17 @@ export function UserProfilePanel({
         relayAgent,
         managedAgent,
         channelsQuery.data,
+        profileSummary,
+        currentPubkey,
       ),
-    [pubkeyLower, relayAgent, managedAgent, channelsQuery.data],
+    [
+      pubkeyLower,
+      relayAgent,
+      managedAgent,
+      channelsQuery.data,
+      profileSummary,
+      currentPubkey,
+    ],
   );
 
   const channelIdToName = React.useMemo(() => {
