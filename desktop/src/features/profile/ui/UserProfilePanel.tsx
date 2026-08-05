@@ -70,7 +70,6 @@ import {
   UserProfilePersonaDialogs,
 } from "@/features/profile/ui/UserProfilePersonaDialogs";
 import {
-  deriveProfileChannels,
   type ProfilePanelTab,
   type ProfilePanelView,
   profilePanelTargetKey,
@@ -79,6 +78,7 @@ import {
   resolveProfileDisplayName,
   truncatePubkey,
   type UserProfilePanelProps,
+  useDerivedProfileChannels,
   useRetainedPersona,
 } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useProfileInteractionActions } from "@/features/profile/ui/useProfileInteractionActions";
@@ -354,24 +354,13 @@ export function UserProfilePanel({
     ) ??
       false);
 
-  const profileChannels = React.useMemo(
-    () =>
-      deriveProfileChannels(
-        pubkeyLower,
-        relayAgent,
-        managedAgent,
-        channelsQuery.data,
-        profileSummary,
-        currentPubkey,
-      ),
-    [
-      pubkeyLower,
-      relayAgent,
-      managedAgent,
-      channelsQuery.data,
-      profileSummary,
-      currentPubkey,
-    ],
+  const profileChannels = useDerivedProfileChannels(
+    pubkeyLower,
+    relayAgent,
+    managedAgent,
+    channelsQuery.data,
+    profileSummary,
+    currentPubkey,
   );
 
   const channelIdToName = React.useMemo(() => {
