@@ -90,6 +90,10 @@ function createView(text, options = {}) {
   };
 
   return {
+    dom: editor.view.dom,
+    domAtPos(position) {
+      return editor.view.domAtPos(position);
+    },
     get state() {
       return editor.state;
     },
@@ -132,6 +136,29 @@ test("inserts the first character after a highlighted agent mention through Pros
     0x20,
   );
   assert.equal(view.state.selection.from, 1 + "@Reinhold t".length);
+});
+
+test("maps the caret after the separator outside the agent chip DOM", () => {
+  const view = createView("@Reinhold ", { decorated: true });
+  const label = view.dom.querySelector(".agent-mention-highlight");
+  assert.ok(label);
+
+  const separator = label.nextSibling;
+  assert.equal(separator?.nodeType, Node.TEXT_NODE);
+  assert.equal(separator?.textContent, " ");
+  assert.equal(view.state.selection.from, 1 + "@Reinhold ".length);
+
+  const mappedCaret = view.domAtPos(view.state.selection.from);
+  assert.ok(
+    (mappedCaret.node === separator && mappedCaret.offset === 1) ||
+      (mappedCaret.node === separator?.parentNode &&
+        mappedCaret.offset ===
+          Array.prototype.indexOf.call(
+            separator.parentNode.childNodes,
+            separator,
+          ) +
+            1),
+  );
 });
 
 test("leaves ordinary typing outside an agent-mention boundary to the browser", () => {
