@@ -229,9 +229,6 @@ export function useRichTextEditor({
   const placeholderRef = React.useRef(placeholder);
   placeholderRef.current = placeholder;
 
-  const agentMentionNamesRef = React.useRef(agentMentionNames);
-  agentMentionNamesRef.current = agentMentionNames;
-
   // Custom-emoji atom node wiring (config + src re-resolve). Kept in a sibling
   // hook so this file stays focused on generic editor setup.
   const customEmojiWiring = useComposerCustomEmoji(customEmoji);
@@ -500,11 +497,7 @@ export function useRichTextEditor({
         },
         handleDOMEvents: {
           beforeinput: (view, event) =>
-            handleMentionBoundaryBeforeInput(
-              view,
-              event as InputEvent,
-              agentMentionNamesRef.current ?? [],
-            ),
+            handleMentionBoundaryBeforeInput(view, event as InputEvent),
         },
         // ArrowUp in an empty composer → edit your last message (Slack
         // parity). Handled here in ProseMirror's own DOM `keydown` hook —

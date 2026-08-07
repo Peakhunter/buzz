@@ -1,39 +1,101 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { after, afterEach, before, test } from "node:test";
 
-import { Schema } from "@tiptap/pm/model";
-import { EditorState, TextSelection } from "@tiptap/pm/state";
+import { Editor } from "@tiptap/core";
+import { TextSelection } from "@tiptap/pm/state";
+import StarterKit from "@tiptap/starter-kit";
+import { JSDOM } from "jsdom";
 
 import { handleMentionBoundaryBeforeInput } from "./mentionBoundaryBeforeInput.ts";
+import {
+  MentionHighlightExtension,
+  mentionHighlightKey,
+} from "./mentionHighlightExtension.ts";
 
-const schema = new Schema({
-  nodes: {
-    doc: { content: "block+" },
-    paragraph: { group: "block", content: "inline*" },
-    text: { group: "inline" },
-  },
+const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+  pretendToBeVisual: true,
+  url: "http://localhost",
+});
+const editors = new Set();
+
+before(() => {
+  Object.assign(globalThis, {
+    document: dom.window.document,
+    DocumentFragment: dom.window.DocumentFragment,
+    DOMParser: dom.window.DOMParser,
+    Element: dom.window.Element,
+    getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+    getSelection: dom.window.getSelection.bind(dom.window),
+    HTMLElement: dom.window.HTMLElement,
+    MutationObserver: dom.window.MutationObserver,
+    Node: dom.window.Node,
+    requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
+    window: dom.window,
+  });
 });
 
+afterEach(() => {
+  for (const editor of editors) editor.destroy();
+  editors.clear();
+});
+
+after(() => dom.window.close());
+
+function paragraphContent(text) {
+  return text ? [{ type: "text", text }] : [];
+}
+
 function createView(text, options = {}) {
-  const doc = schema.node("doc", null, [
-    schema.node("paragraph", null, text ? [schema.text(text)] : []),
-  ]);
-  const from = options.from ?? 1 + text.length;
-  const to = options.to ?? from;
-  let state = EditorState.create({
-    doc,
-    selection: TextSelection.create(doc, from, to),
+  const editor = new Editor({
+    content: {
+      type: "doc",
+      content: [
+        {
+          type: "paragraph",
+          content: options.content ?? paragraphContent(text),
+        },
+      ],
+    },
+    element: document.createElement("div"),
+    extensions: [
+      StarterKit.configure({
+        heading: false,
+        link: false,
+        trailingNode: false,
+      }),
+      MentionHighlightExtension,
+    ],
   });
+  editors.add(editor);
+
+  const storage = editor.storage.mentionHighlight;
+  storage.names = [];
+  storage.agentNames = options.decorated ? ["Reinhold"] : [];
+  storage.channelNames = [];
+  editor.view.dispatch(editor.state.tr.setMeta(mentionHighlightKey, true));
+
+  const doc = editor.state.doc;
+  const textLength = doc.textContent.length;
+  const from = options.from ?? 1 + textLength;
+  const to = options.to ?? from;
+  editor.view.dispatch(
+    editor.state.tr.setSelection(TextSelection.create(doc, from, to)),
+  );
+
   let dispatchCount = 0;
+  const originalDispatch = editor.view.dispatch.bind(editor.view);
+  editor.view.dispatch = (transaction) => {
+    dispatchCount += 1;
+    originalDispatch(transaction);
+  };
 
   return {
     get state() {
-      return state;
+      return editor.state;
     },
     composing: options.composing ?? false,
     dispatch(transaction) {
-      dispatchCount += 1;
-      state = state.apply(transaction);
+      editor.view.dispatch(transaction);
     },
     get dispatchCount() {
       return dispatchCount;
@@ -58,13 +120,10 @@ function createBeforeInput(overrides = {}) {
 }
 
 test("inserts the first character after a highlighted agent mention through ProseMirror", () => {
-  const view = createView("@Reinhold ");
+  const view = createView("@Reinhold ", { decorated: true });
   const event = createBeforeInput();
 
-  assert.equal(
-    handleMentionBoundaryBeforeInput(view, event, ["Reinhold"]),
-    true,
-  );
+  assert.equal(handleMentionBoundaryBeforeInput(view, event), true);
   assert.equal(event.prevented, true);
   assert.equal(view.dispatchCount, 1);
   assert.equal(view.state.doc.textContent, "@Reinhold t");
@@ -79,10 +138,7 @@ test("leaves ordinary typing outside an agent-mention boundary to the browser", 
   const view = createView("ordinary ");
   const event = createBeforeInput();
 
-  assert.equal(
-    handleMentionBoundaryBeforeInput(view, event, ["Reinhold"]),
-    false,
-  );
+  assert.equal(handleMentionBoundaryBeforeInput(view, event), false);
   assert.equal(event.prevented, false);
   assert.equal(view.dispatchCount, 0);
 });
@@ -91,14 +147,14 @@ test("requires a collapsed selection after a U+0020 separator", () => {
   const selectedView = createView("@Reinhold ", { from: 1, to: 2 });
   const selectedEvent = createBeforeInput();
   assert.equal(
-    handleMentionBoundaryBeforeInput(selectedView, selectedEvent, ["Reinhold"]),
+    handleMentionBoundaryBeforeInput(selectedView, selectedEvent),
     false,
   );
 
   const noSpaceView = createView("@Reinhold");
   const noSpaceEvent = createBeforeInput();
   assert.equal(
-    handleMentionBoundaryBeforeInput(noSpaceView, noSpaceEvent, ["Reinhold"]),
+    handleMentionBoundaryBeforeInput(noSpaceView, noSpaceEvent),
     false,
   );
 });
@@ -107,38 +163,81 @@ test("does not intercept an unhighlighted mention", () => {
   const view = createView("@Reinhold ");
   const event = createBeforeInput();
 
-  assert.equal(handleMentionBoundaryBeforeInput(view, event, []), false);
+  assert.equal(handleMentionBoundaryBeforeInput(view, event), false);
+  assert.equal(event.prevented, false);
+  assert.equal(view.dispatchCount, 0);
+});
+
+test("does not infer an agent mention from marked text without a decoration", () => {
+  const view = createView("@Reinhold ", {
+    content: [
+      { type: "text", marks: [{ type: "bold" }], text: "@Reinhold" },
+      { type: "text", text: " " },
+    ],
+  });
+  const event = createBeforeInput();
+
+  assert.equal(handleMentionBoundaryBeforeInput(view, event), false);
+  assert.equal(event.prevented, false);
+  assert.equal(view.dispatchCount, 0);
+});
+
+test("accepts marked text when the exact mention range is decorated", () => {
+  const view = createView("@Reinhold ", {
+    decorated: true,
+    content: [
+      { type: "text", marks: [{ type: "bold" }], text: "@Reinhold" },
+      { type: "text", text: " " },
+    ],
+  });
+  const event = createBeforeInput();
+
+  assert.equal(handleMentionBoundaryBeforeInput(view, event), true);
+  assert.equal(event.prevented, true);
+  assert.equal(view.dispatchCount, 1);
+  assert.equal(view.state.doc.textContent, "@Reinhold t");
+});
+
+test("does not infer an agent mention across split text nodes", () => {
+  const view = createView("@Reinhold ", {
+    decorated: true,
+    content: [
+      { type: "text", marks: [{ type: "bold" }], text: "@Rein" },
+      { type: "text", text: "hold " },
+    ],
+  });
+  const event = createBeforeInput();
+
+  assert.equal(handleMentionBoundaryBeforeInput(view, event), false);
   assert.equal(event.prevented, false);
   assert.equal(view.dispatchCount, 0);
 });
 
 test("does not intercept paste or replacement input", () => {
   for (const inputType of ["insertFromPaste", "insertReplacementText"]) {
-    const view = createView("@Reinhold ");
+    const view = createView("@Reinhold ", { decorated: true });
     const event = createBeforeInput({ inputType });
-    assert.equal(
-      handleMentionBoundaryBeforeInput(view, event, ["Reinhold"]),
-      false,
-    );
+    assert.equal(handleMentionBoundaryBeforeInput(view, event), false);
     assert.equal(event.prevented, false);
     assert.equal(view.dispatchCount, 0);
   }
 });
 
 test("does not intercept composition or IME input", () => {
-  const composingEventView = createView("@Reinhold ");
+  const composingEventView = createView("@Reinhold ", { decorated: true });
   const composingEvent = createBeforeInput({ isComposing: true });
   assert.equal(
-    handleMentionBoundaryBeforeInput(composingEventView, composingEvent, [
-      "Reinhold",
-    ]),
+    handleMentionBoundaryBeforeInput(composingEventView, composingEvent),
     false,
   );
 
-  const composingView = createView("@Reinhold ", { composing: true });
+  const composingView = createView("@Reinhold ", {
+    composing: true,
+    decorated: true,
+  });
   const commitEvent = createBeforeInput();
   assert.equal(
-    handleMentionBoundaryBeforeInput(composingView, commitEvent, ["Reinhold"]),
+    handleMentionBoundaryBeforeInput(composingView, commitEvent),
     false,
   );
 });

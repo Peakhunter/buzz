@@ -1,10 +1,7 @@
 import { TextSelection } from "@tiptap/pm/state";
 import type { EditorView } from "@tiptap/pm/view";
 
-import {
-  buildHighlightPatterns,
-  findHighlightMatches,
-} from "./mentionHighlightExtension";
+import { findAgentMentionDecorationEndingAt } from "./mentionHighlightExtension";
 
 /**
  * Bypass native contenteditable mutation for the first ordinary character
@@ -18,7 +15,6 @@ import {
 export function handleMentionBoundaryBeforeInput(
   view: EditorView,
   event: InputEvent,
-  agentMentionNames: readonly string[],
 ): boolean {
   const insertedText = event.data;
   if (
@@ -46,13 +42,10 @@ export function handleMentionBoundaryBeforeInput(
   );
   if (!textBeforeCaret.endsWith(" ")) return false;
 
-  const textBeforeSeparator = textBeforeCaret.slice(0, -1);
-  const patterns = buildHighlightPatterns([...agentMentionNames], []);
-  const immediatelyAfterAgentMention = findHighlightMatches(
-    textBeforeSeparator,
-    patterns,
-  ).some((match) => match.to === textBeforeSeparator.length);
-  if (!immediatelyAfterAgentMention) return false;
+  const separatorPosition = from - 1;
+  if (!findAgentMentionDecorationEndingAt(view.state, separatorPosition)) {
+    return false;
+  }
 
   event.preventDefault();
   const transaction = view.state.tr.insertText(insertedText, from, from);
