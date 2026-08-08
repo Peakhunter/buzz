@@ -4185,7 +4185,7 @@ mod tests {
 
     async fn capture_system_prompt_lifecycle(
         initialize_result: serde_json::Value,
-    ) -> (serde_json::Value, serde_json::Value, bool) {
+    ) -> (serde_json::Value, serde_json::Value, bool, Vec<String>) {
         let capture_path =
             std::env::temp_dir().join(format!("buzz-acp-persistent-{}.jsonl", Uuid::new_v4()));
         let capture = capture_path.to_string_lossy();
@@ -4293,49 +4293,74 @@ sleep 1"#
             requests[0].clone(),
             requests[1].clone(),
             has_system_prompt_support,
+            prompt_blocks,
         )
-    }
-
-    fn captured_prompt_text(request: &serde_json::Value) -> String {
-        request
-            .pointer("/params/prompt")
-            .and_then(serde_json::Value::as_array)
-            .expect("session/prompt must contain prompt blocks")
-            .iter()
-            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     #[tokio::test]
     async fn persistent_capability_sends_static_prompt_once_and_omits_it_from_user_turn() {
-        let (session_new, session_prompt, supported) = capture_system_prompt_lifecycle(json!({
+        let (session_new, session_prompt, supported, prompt_blocks) =
+            capture_system_prompt_lifecycle(json!({
             "protocolVersion": 1,
             "agentInfo": {"name": "codex-acp"},
             "_meta": {"capabilities": {"persistentSystemPrompt": true}},
-        }))
-        .await;
+            }))
+            .await;
         assert!(supported);
+        let combined = "[Base]\nBASE-CONTENT\n\n[System]\nSYSTEM-CONTENT\n\n[Team Instructions]\nTEAM-CONTENT\n\n[Agent Memory — core]\nCORE-CONTENT\n\n[Channel Canvas]\nCANVAS-CONTENT";
         assert_eq!(
-            session_new.pointer("/params/_meta/systemPrompt"),
-            Some(&json!(
-                "[Base]\nBASE-CONTENT\n\n[System]\nSYSTEM-CONTENT\n\n[Team Instructions]\nTEAM-CONTENT\n\n[Agent Memory — core]\nCORE-CONTENT\n\n[Channel Canvas]\nCANVAS-CONTENT"
-            ))
+            session_new,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": ".",
+                    "mcpServers": [],
+                    "_meta": {
+                        "systemPrompt": combined,
+                        "sessionTitle": "Codex · #test",
+                    },
+                },
+            })
         );
-        assert!(session_new.pointer("/params/systemPrompt").is_none());
-        assert!(session_new.pointer("/params/_meta/sessionTitle").is_some());
-
-        let user_prompt = captured_prompt_text(&session_prompt);
-        for repeated_section in [
+        assert_eq!(
+            prompt_blocks.len(),
+            2,
+            "capable turn has context + event only"
+        );
+        let expected_prompt_blocks: Vec<serde_json::Value> = prompt_blocks
+            .iter()
+            .map(|text| json!({"type": "text", "text": text}))
+            .collect();
+        assert_eq!(
+            session_prompt,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": expected_prompt_blocks,
+                },
+            })
+        );
+        let user_prompt = prompt_blocks.join("\n");
+        for repeated_static_content in [
             "[Base]",
+            "BASE-CONTENT",
             "[System]",
+            "SYSTEM-CONTENT",
             "[Team Instructions]",
+            "TEAM-CONTENT",
             "[Agent Memory — core]",
+            "CORE-CONTENT",
             "[Channel Canvas]",
+            "CANVAS-CONTENT",
         ] {
             assert!(
-                !user_prompt.contains(repeated_section),
-                "capable agent user prompt repeated {repeated_section}: {user_prompt}"
+                !user_prompt.contains(repeated_static_content),
+                "capable user prompt repeated {repeated_static_content}: {user_prompt}"
             );
         }
         assert!(user_prompt.contains("test"), "event content must remain");
@@ -4378,28 +4403,56 @@ sleep 1"#
         ];
 
         for (label, initialize_result) in cases {
-            let (session_new, session_prompt, supported) =
+            let (session_new, session_prompt, supported, prompt_blocks) =
                 capture_system_prompt_lifecycle(initialize_result).await;
             assert!(!supported, "{label} metadata must fail closed");
-            assert!(
-                session_new.pointer("/params/_meta/systemPrompt").is_none(),
-                "{label} metadata must not emit persistent metadata"
+            assert_eq!(
+                session_new,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {
+                        "cwd": ".",
+                        "mcpServers": [],
+                        "_meta": {"sessionTitle": "Codex · #test"},
+                    },
+                }),
+                "{label} metadata changed the legacy session/new envelope"
             );
-            assert!(session_new.pointer("/params/systemPrompt").is_none());
-
-            let user_prompt = captured_prompt_text(&session_prompt);
-            for legacy_section in [
-                "[Base]\nBASE-CONTENT",
-                "[System]\nSYSTEM-CONTENT",
-                "[Team Instructions]\nTEAM-CONTENT",
-                "[Agent Memory — core]\nCORE-CONTENT",
-                "[Channel Canvas]\nCANVAS-CONTENT",
-            ] {
-                assert!(
-                    user_prompt.contains(legacy_section),
-                    "{label} legacy prompt omitted {legacy_section}: {user_prompt}"
-                );
-            }
+            assert_eq!(
+                prompt_blocks.len(),
+                7,
+                "legacy turn has five static + context + event blocks"
+            );
+            assert_eq!(
+                &prompt_blocks[..5],
+                [
+                    "[Base]\nBASE-CONTENT",
+                    "[System]\nSYSTEM-CONTENT",
+                    "[Team Instructions]\nTEAM-CONTENT",
+                    "[Agent Memory — core]\nCORE-CONTENT",
+                    "[Channel Canvas]\nCANVAS-CONTENT",
+                ],
+                "{label} legacy static block order changed"
+            );
+            let expected_prompt_blocks: Vec<serde_json::Value> = prompt_blocks
+                .iter()
+                .map(|text| json!({"type": "text", "text": text}))
+                .collect();
+            assert_eq!(
+                session_prompt,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": "session-1",
+                        "prompt": expected_prompt_blocks,
+                    },
+                }),
+                "{label} legacy session/prompt envelope changed"
+            );
         }
     }
 
