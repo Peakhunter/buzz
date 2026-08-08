@@ -2257,6 +2257,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persistent_system_prompt_capability_requires_explicit_true() {
+        assert!(read_persistent_system_prompt_capability(&serde_json::json!({
+            "_meta": {
+                "capabilities": {
+                    "persistentSystemPrompt": true
+                }
+            }
+        })));
+        for result in [
+            serde_json::json!({}),
+            serde_json::json!({"_meta": {"capabilities": {}}}),
+            serde_json::json!({"_meta": {"capabilities": {"persistentSystemPrompt": false}}}),
+            serde_json::json!({"_meta": {"capabilities": {"persistentSystemPrompt": "true"}}}),
+        ] {
+            assert!(!read_persistent_system_prompt_capability(&result));
+        }
+    }
+
+    #[test]
     fn stop_reason_parses_all_known_values() {
         assert_eq!(StopReason::from_str("end_turn"), Some(StopReason::EndTurn));
         assert_eq!(

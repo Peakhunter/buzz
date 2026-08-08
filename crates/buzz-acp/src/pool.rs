@@ -4138,6 +4138,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_persistent_system_prompt_capability_enables_protocol_v1_agent() {
+        assert!(has_system_prompt_support(1, "codex-acp", None, true));
+        assert_eq!(
+            session_new_system_prompt(false, 1, "codex-acp", true, Some("instructions")),
+            Some(SystemPromptTransport::PersistentMeta("instructions"))
+        );
+    }
+
+    #[test]
+    fn absent_persistent_system_prompt_capability_preserves_legacy_fallback() {
+        assert!(!has_system_prompt_support(1, "codex-acp", None, false));
+        assert_eq!(
+            session_new_system_prompt(false, 1, "codex-acp", false, Some("instructions")),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_persistent_capability_prefers_meta_over_protocol_v2_field() {
+        assert_eq!(
+            session_new_system_prompt(false, 2, "future-agent", true, Some("instructions")),
+            Some(SystemPromptTransport::PersistentMeta("instructions"))
+        );
+    }
+
+    #[test]
     fn old_zed_adapter_name_falls_through_to_protocol_version_gate() {
         // The renamed @zed-industries package predates the _meta.systemPrompt support,
         // so it must not be treated as capable and stays on legacy user-message framing.
