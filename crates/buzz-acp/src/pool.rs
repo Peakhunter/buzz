@@ -4183,6 +4183,226 @@ mod tests {
         );
     }
 
+    async fn capture_system_prompt_lifecycle(
+        initialize_result: serde_json::Value,
+    ) -> (serde_json::Value, serde_json::Value, bool) {
+        let capture_path =
+            std::env::temp_dir().join(format!("buzz-acp-persistent-{}.jsonl", Uuid::new_v4()));
+        let capture = capture_path.to_string_lossy();
+        let initialize_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": initialize_result,
+        })
+        .to_string();
+        let session_new_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"sessionId": "session-1"},
+        })
+        .to_string();
+        let session_prompt_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"stopReason": "end_turn"},
+        })
+        .to_string();
+        let script = format!(
+            r#"read -r _initialize
+printf '%s\n' '{initialize_response}'
+read -r session_new
+printf '%s\n' "$session_new" > '{capture}'
+printf '%s\n' '{session_new_response}'
+read -r session_prompt
+printf '%s\n' "$session_prompt" >> '{capture}'
+printf '%s\n' '{session_prompt_response}'
+sleep 1"#
+        );
+        let mut acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn lifecycle test agent");
+        acp.initialize()
+            .await
+            .expect("initialize lifecycle test agent");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "codex-acp".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.base_prompt = Some("BASE-CONTENT");
+        ctx.system_prompt = Some("SYSTEM-CONTENT".into());
+        ctx.team_instructions = Some("TEAM-CONTENT".into());
+        ctx.session_title = Some("Codex".into());
+        let core = "[Agent Memory — core]\nCORE-CONTENT";
+        let canvas = "[Channel Canvas]\nCANVAS-CONTENT";
+        let session_id = create_session_and_apply_model(
+            &mut agent,
+            &ctx,
+            Some(core),
+            Some(canvas),
+            Some("test"),
+            None,
+            None,
+        )
+        .await
+        .expect("create lifecycle test session");
+
+        let has_system_prompt_support = agent.has_system_prompt_support();
+        let batch = one_event_batch(Uuid::new_v4());
+        let prompt_blocks = crate::queue::format_prompt(
+            &batch,
+            &crate::queue::FormatPromptArgs {
+                has_system_prompt_support,
+                base_prompt: ctx.base_prompt,
+                system_prompt: ctx.system_prompt.as_deref(),
+                team_instructions: ctx.team_instructions.as_deref(),
+                agent_core: Some(core),
+                agent_canvas: Some(canvas),
+                ..Default::default()
+            },
+        );
+        let prompt_refs: Vec<&str> = prompt_blocks.iter().map(String::as_str).collect();
+        let stop_reason = agent
+            .acp
+            .session_prompt_blocks_with_idle_timeout(
+                &session_id,
+                &prompt_refs,
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("send lifecycle test prompt");
+        assert_eq!(stop_reason, StopReason::EndTurn);
+
+        let captured = std::fs::read_to_string(&capture_path).expect("read lifecycle capture");
+        let _ = std::fs::remove_file(&capture_path);
+        let requests: Vec<serde_json::Value> = captured
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured request must be JSON"))
+            .collect();
+        assert_eq!(requests.len(), 2, "capture session/new then session/prompt");
+        (
+            requests[0].clone(),
+            requests[1].clone(),
+            has_system_prompt_support,
+        )
+    }
+
+    fn captured_prompt_text(request: &serde_json::Value) -> String {
+        request
+            .pointer("/params/prompt")
+            .and_then(serde_json::Value::as_array)
+            .expect("session/prompt must contain prompt blocks")
+            .iter()
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn persistent_capability_sends_static_prompt_once_and_omits_it_from_user_turn() {
+        let (session_new, session_prompt, supported) = capture_system_prompt_lifecycle(json!({
+            "protocolVersion": 1,
+            "agentInfo": {"name": "codex-acp"},
+            "_meta": {"capabilities": {"persistentSystemPrompt": true}},
+        }))
+        .await;
+        assert!(supported);
+        assert_eq!(
+            session_new.pointer("/params/_meta/systemPrompt"),
+            Some(&json!(
+                "[Base]\nBASE-CONTENT\n\n[System]\nSYSTEM-CONTENT\n\n[Team Instructions]\nTEAM-CONTENT\n\n[Agent Memory — core]\nCORE-CONTENT\n\n[Channel Canvas]\nCANVAS-CONTENT"
+            ))
+        );
+        assert!(session_new.pointer("/params/systemPrompt").is_none());
+        assert!(session_new.pointer("/params/_meta/sessionTitle").is_some());
+
+        let user_prompt = captured_prompt_text(&session_prompt);
+        for repeated_section in [
+            "[Base]",
+            "[System]",
+            "[Team Instructions]",
+            "[Agent Memory — core]",
+            "[Channel Canvas]",
+        ] {
+            assert!(
+                !user_prompt.contains(repeated_section),
+                "capable agent user prompt repeated {repeated_section}: {user_prompt}"
+            );
+        }
+        assert!(user_prompt.contains("test"), "event content must remain");
+    }
+
+    #[tokio::test]
+    async fn unsupported_capabilities_omit_persistent_metadata_and_preserve_legacy_sections() {
+        let cases = [
+            (
+                "absent",
+                json!({
+                    "protocolVersion": 1,
+                    "agentInfo": {"name": "codex-acp"},
+                }),
+            ),
+            (
+                "false",
+                json!({
+                    "protocolVersion": 1,
+                    "agentInfo": {"name": "codex-acp"},
+                    "_meta": {"capabilities": {"persistentSystemPrompt": false}},
+                }),
+            ),
+            (
+                "malformed",
+                json!({
+                    "protocolVersion": 1,
+                    "agentInfo": {"name": "codex-acp"},
+                    "_meta": {"capabilities": {"persistentSystemPrompt": "true"}},
+                }),
+            ),
+            (
+                "unknown-only",
+                json!({
+                    "protocolVersion": 1,
+                    "agentInfo": {"name": "codex-acp"},
+                    "_meta": {"capabilities": {"futureCapability": true}},
+                }),
+            ),
+        ];
+
+        for (label, initialize_result) in cases {
+            let (session_new, session_prompt, supported) =
+                capture_system_prompt_lifecycle(initialize_result).await;
+            assert!(!supported, "{label} metadata must fail closed");
+            assert!(
+                session_new.pointer("/params/_meta/systemPrompt").is_none(),
+                "{label} metadata must not emit persistent metadata"
+            );
+            assert!(session_new.pointer("/params/systemPrompt").is_none());
+
+            let user_prompt = captured_prompt_text(&session_prompt);
+            for legacy_section in [
+                "[Base]\nBASE-CONTENT",
+                "[System]\nSYSTEM-CONTENT",
+                "[Team Instructions]\nTEAM-CONTENT",
+                "[Agent Memory — core]\nCORE-CONTENT",
+                "[Channel Canvas]\nCANVAS-CONTENT",
+            ] {
+                assert!(
+                    user_prompt.contains(legacy_section),
+                    "{label} legacy prompt omitted {legacy_section}: {user_prompt}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn old_zed_adapter_name_falls_through_to_protocol_version_gate() {
         // The renamed @zed-industries package predates the _meta.systemPrompt support,
