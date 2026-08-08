@@ -183,13 +183,14 @@ fn has_system_prompt_support(
     protocol_version: u32,
     agent_name: &str,
     goose_system_prompt_supported: Option<bool>,
+    persistent_system_prompt_supported: bool,
 ) -> bool {
     if agent_name == "goose" {
         goose_system_prompt_supported == Some(true)
     } else if agent_name == CLAUDE_AGENT_ACP_NAME {
         true
     } else {
-        protocol_version >= 2
+        persistent_system_prompt_supported || protocol_version >= 2
     }
 }
 
@@ -197,12 +198,17 @@ fn session_new_system_prompt<'a>(
     is_goose: bool,
     protocol_version: u32,
     agent_name: &str,
+    persistent_system_prompt_supported: bool,
     prompt: Option<&'a str>,
 ) -> Option<SystemPromptTransport<'a>> {
-    if is_goose || (protocol_version < 2 && agent_name != CLAUDE_AGENT_ACP_NAME) {
+    if is_goose {
         None
     } else if agent_name == CLAUDE_AGENT_ACP_NAME {
         prompt.map(SystemPromptTransport::ClaudeMeta)
+    } else if persistent_system_prompt_supported {
+        prompt.map(SystemPromptTransport::PersistentMeta)
+    } else if protocol_version < 2 {
+        None
     } else {
         prompt.map(SystemPromptTransport::Field)
     }
@@ -214,6 +220,7 @@ impl OwnedAgent {
             self.protocol_version,
             &self.agent_name,
             self.goose_system_prompt_supported,
+            self.acp.persistent_system_prompt_supported(),
         )
     }
 }
@@ -892,8 +899,8 @@ async fn create_session_and_apply_model(
     channel_type: Option<&str>,
 ) -> Result<String, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
-    // single prompt. Standard protocol-v2 agents receive it in `session/new`;
-    // Goose receives it through the custom request below. Legacy agents receive
+    // single prompt. Protocol-v2 or explicitly capable agents receive it in
+    // `session/new`; Goose receives it through the custom request below. Legacy agents receive
     // the same content as user-message sections via `format_prompt`. Core carries
     // its own `[Agent Memory — core]` header, and canvas carries its own
     // `[Channel Canvas]` header; both are appended with a blank-line separator.
@@ -920,17 +927,20 @@ async fn create_session_and_apply_model(
         ctx.session_title.as_deref(),
     );
 
+    let persistent_system_prompt_supported = agent.acp.persistent_system_prompt_supported();
+    let system_prompt_transport = session_new_system_prompt(
+        is_goose,
+        agent.protocol_version,
+        &agent.agent_name,
+        persistent_system_prompt_supported,
+        combined_system_prompt.as_deref(),
+    );
     let resp = agent
         .acp
         .session_new_full(
             &ctx.cwd,
             mcp_servers,
-            session_new_system_prompt(
-                is_goose,
-                agent.protocol_version,
-                &agent.agent_name,
-                combined_system_prompt.as_deref(),
-            ),
+            system_prompt_transport,
             session_title.as_deref(),
         )
         .await?;
@@ -4097,33 +4107,33 @@ mod tests {
 
     #[test]
     fn goose_uses_system_prompt_only_after_custom_method_succeeds() {
-        assert!(!has_system_prompt_support(2, "goose", None));
-        assert!(!has_system_prompt_support(2, "goose", Some(false)));
-        assert!(has_system_prompt_support(2, "goose", Some(true)));
-        assert!(has_system_prompt_support(1, "goose", Some(true)));
-        assert!(has_system_prompt_support(2, "buzz-agent", None));
+        assert!(!has_system_prompt_support(2, "goose", None, false));
+        assert!(!has_system_prompt_support(2, "goose", Some(false), false));
+        assert!(has_system_prompt_support(2, "goose", Some(true), false));
+        assert!(has_system_prompt_support(1, "goose", Some(true), false));
+        assert!(has_system_prompt_support(2, "buzz-agent", None, false));
         // Goose never receives system prompt via session/new (uses post-hoc method).
         assert_eq!(
-            session_new_system_prompt(true, 2, "goose", Some("instructions")),
+            session_new_system_prompt(true, 2, "goose", false, Some("instructions")),
             None
         );
         // Protocol-v2 non-goose gets Field transport.
         assert_eq!(
-            session_new_system_prompt(false, 2, "buzz-agent", Some("instructions")),
+            session_new_system_prompt(false, 2, "buzz-agent", false, Some("instructions")),
             Some(SystemPromptTransport::Field("instructions"))
         );
         // Protocol-v1 non-goose, non-claude gets None (legacy user-message framing).
         assert_eq!(
-            session_new_system_prompt(false, 1, "codex", Some("instructions")),
+            session_new_system_prompt(false, 1, "codex", false, Some("instructions")),
             None
         );
         // claude-agent-acp gets ClaudeMeta transport regardless of protocol version.
         assert_eq!(
-            session_new_system_prompt(false, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
+            session_new_system_prompt(false, 1, CLAUDE_AGENT_ACP_NAME, false, Some("instructions")),
             Some(SystemPromptTransport::ClaudeMeta("instructions"))
         );
         assert_eq!(
-            session_new_system_prompt(true, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
+            session_new_system_prompt(true, 1, CLAUDE_AGENT_ACP_NAME, false, Some("instructions")),
             None,
             "goose path must never produce a transport even when agent_name matches"
         );
@@ -4133,8 +4143,18 @@ mod tests {
     fn claude_agent_acp_has_system_prompt_support_regardless_of_protocol_version() {
         // claude-agent-acp declares protocolVersion:1 but supports _meta.systemPrompt;
         // has_system_prompt_support must return true so user-message framing is suppressed.
-        assert!(has_system_prompt_support(1, CLAUDE_AGENT_ACP_NAME, None));
-        assert!(has_system_prompt_support(2, CLAUDE_AGENT_ACP_NAME, None));
+        assert!(has_system_prompt_support(
+            1,
+            CLAUDE_AGENT_ACP_NAME,
+            None,
+            false
+        ));
+        assert!(has_system_prompt_support(
+            2,
+            CLAUDE_AGENT_ACP_NAME,
+            None,
+            false
+        ));
     }
 
     #[test]
@@ -4168,8 +4188,8 @@ mod tests {
         // The renamed @zed-industries package predates the _meta.systemPrompt support,
         // so it must not be treated as capable and stays on legacy user-message framing.
         let old_name = "@zed-industries/claude-code-acp";
-        assert!(!has_system_prompt_support(1, old_name, None));
-        assert!(has_system_prompt_support(2, old_name, None));
+        assert!(!has_system_prompt_support(1, old_name, None, false));
+        assert!(has_system_prompt_support(2, old_name, None, false));
     }
 
     #[test]
