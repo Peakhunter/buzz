@@ -3,6 +3,7 @@
 - **Status:** Accepted; implementation not started
 - **Decision date:** 2026-08-09
 - **Scope:** Buzz desktop managed-agent runtimes and ACP adapters
+- **Implementation disposition:** [Functional Candidate v5 change disposition](0001-hybrid-agent-runtime-change-disposition.md)
 
 ## Context
 
