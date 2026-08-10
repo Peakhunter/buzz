@@ -142,6 +142,13 @@ jobs:
         id: pnpm_cache
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
 
+      - name: Get Cargo home directory
+        id: cargo_cache
+        run: |
+          set -euo pipefail
+          test -n "${CARGO_HOME:-}"
+          echo "path=$CARGO_HOME" >> "$GITHUB_OUTPUT"
+
       - name: Freeze cache keys before build-time lockfile changes
         id: cache_keys
         env:
@@ -150,7 +157,8 @@ jobs:
           PNPM_HASH: ${{ hashFiles('pnpm-lock.yaml') }}
           CARGO_HASH: ${{ hashFiles('Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
           COMPILER_HASH: ${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
-          NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'bin/.cmake-*.pkg') }}
+          NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'bin/.cmake-*.pkg') }}
+          LEGACY_NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'bin/.cmake-*.pkg') }}
         run: |
           set -euo pipefail
           echo "pnpm_key=pnpm-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-${PNPM_HASH}" >> "$GITHUB_OUTPUT"
@@ -158,6 +166,7 @@ jobs:
           echo "compiler_scope=rust-compiler-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-${COMPILER_HASH}" >> "$GITHUB_OUTPUT"
           echo "compiler_key=rust-compiler-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-${COMPILER_HASH}-${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
           echo "mesh_scope=mesh-llama-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-metal-macos10.15-${NATIVE_HASH}" >> "$GITHUB_OUTPUT"
+          echo "mesh_legacy_scope=mesh-llama-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-metal-macos10.15-${LEGACY_NATIVE_HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store cache
         id: pnpm_restore
@@ -173,11 +182,11 @@ jobs:
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/src
-            ~/.cargo/git/db
-            ~/.cargo/git/checkouts
+            ${{ steps.cargo_cache.outputs.path }}/registry/index
+            ${{ steps.cargo_cache.outputs.path }}/registry/cache
+            ${{ steps.cargo_cache.outputs.path }}/registry/src
+            ${{ steps.cargo_cache.outputs.path }}/git/db
+            ${{ steps.cargo_cache.outputs.path }}/git/checkouts
           key: ${{ steps.cache_keys.outputs.cargo_key }}
           restore-keys: |
             cargo-downloads-${{ runner.os }}-${{ runner.arch }}-
@@ -258,6 +267,8 @@ jobs:
         with:
           path: ${{ github.workspace }}/.cache/mesh-llama
           key: ${{ steps.cache_keys.outputs.mesh_scope }}-${{ steps.mesh_rev.outputs.rev }}
+          restore-keys: |
+            ${{ steps.cache_keys.outputs.mesh_legacy_scope }}-${{ steps.mesh_rev.outputs.rev }}
 
       - name: Build mesh llama native libraries
         if: steps.mesh_restore.outputs.cache-hit != 'true'
@@ -394,11 +405,11 @@ jobs:
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/src
-            ~/.cargo/git/db
-            ~/.cargo/git/checkouts
+            ${{ steps.cargo_cache.outputs.path }}/registry/index
+            ${{ steps.cargo_cache.outputs.path }}/registry/cache
+            ${{ steps.cargo_cache.outputs.path }}/registry/src
+            ${{ steps.cargo_cache.outputs.path }}/git/db
+            ${{ steps.cargo_cache.outputs.path }}/git/checkouts
           key: ${{ steps.cache_keys.outputs.cargo_key }}
 
       - name: Save compiler outputs cache
@@ -561,10 +572,6 @@ jobs:
             release-assets/manifest.json \
             release-assets/SHA256SUMS.txt
 
-          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-            -f ref="refs/tags/$TAG" \
-            -f sha="$SOURCE_SHA" >/dev/null
-
           RELEASE_JSON=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,targetCommitish,assets)
           RELEASE_JSON="$RELEASE_JSON" SOURCE_SHA="$SOURCE_SHA" SHORT_SHA="$SHORT_SHA" python3 - <<'PY'
           import json
@@ -613,7 +620,27 @@ jobs:
             exit 1
           fi
 
-          RELEASE_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id)
+          RELEASES_FILE="$RUNNER_TEMP/releases.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RELEASES_FILE"
+          RELEASE_ID=$(
+            RELEASES_FILE="$RELEASES_FILE" TAG="$TAG" python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["RELEASES_FILE"], encoding="utf-8") as releases_file:
+              releases = json.load(releases_file)
+          matches = [
+              release
+              for release in releases
+              if release["tag_name"] == os.environ["TAG"]
+              and release["draft"]
+              and release["prerelease"]
+          ]
+          if len(matches) != 1:
+              raise SystemExit("draft release lookup did not return exactly one matching release")
+          print(matches[0]["id"])
+          PY
+          )
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false >/dev/null
           URL=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
           {

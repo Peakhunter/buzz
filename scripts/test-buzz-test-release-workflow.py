@@ -98,6 +98,7 @@ def main() -> None:
     required_fragments = (
         "Restore pnpm store cache",
         "Save pnpm store cache",
+        "Get Cargo home directory",
         "Restore Cargo downloads cache",
         "Save Cargo downloads cache",
         "Restore compiler outputs cache",
@@ -130,8 +131,6 @@ def main() -> None:
         "actions/upload-artifact@",
         "actions/download-artifact@",
         "gh release create",
-        "--method POST \"repos/$GITHUB_REPOSITORY/git/refs\"",
-        "-f ref=\"refs/tags/$TAG\"",
         "--draft",
         "--prerelease",
         "--target \"$SOURCE_SHA\"",
@@ -139,6 +138,9 @@ def main() -> None:
         "immutable test release already exists",
         "git/tags/$OBJECT_SHA",
         "test release tag resolves to wrong commit",
+        '"repos/$GITHUB_REPOSITORY/releases?per_page=100"',
+        'RELEASES_FILE="$RUNNER_TEMP/releases.json"',
+        "draft release lookup did not return exactly one matching release",
         "draft=false",
         "names != expected",
         "Buzz_test_",
@@ -151,6 +153,13 @@ def main() -> None:
     require('"signed": True' in build, "manifest generator must disclose ad-hoc signed status")
     require("$GITHUB_STEP_SUMMARY" in text, "cache and release telemetry must be summarized")
     require("id: cache_keys" in build, "cache keys must be frozen before build-time lockfile changes")
+    require("id: cargo_cache" in build, "Cargo cache paths must come from the active Hermit CARGO_HOME")
+    require('test -n "${CARGO_HOME:-}"' in build, "Cargo caching must fail closed when Hermit does not expose CARGO_HOME")
+    require("~/.cargo/" not in build, "Cargo downloads must not use the inactive default Cargo home")
+    require(
+        build.count("steps.cargo_cache.outputs.path") == 10,
+        "restore and save must cache five paths under the active Hermit CARGO_HOME",
+    )
     require(
         text.count("steps.cache_keys.outputs.pnpm_key") == 2
         and text.count("steps.cache_keys.outputs.cargo_key") == 2
@@ -167,6 +176,16 @@ def main() -> None:
         and text.count("steps.cache_keys.outputs.mesh_scope") == 2,
         "mesh native cache must freeze OS, architecture, deployment target, toolchain, and dependency scope",
     )
+    require(
+        "NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'bin/.cmake-*.pkg') }}" in build,
+        "mesh native cache scope must not be invalidated by unrelated Cargo lockfile changes",
+    )
+    require(
+        "LEGACY_NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'bin/.cmake-*.pkg') }}" in build
+        and "mesh_legacy_scope=" in build
+        and text.count("steps.cache_keys.outputs.mesh_legacy_scope") == 1,
+        "mesh restores must retain a one-generation fallback to the existing safe cache key",
+    )
 
     build_step = build.index("Build unsigned Tauri app")
     for save_name in ("Save pnpm store cache", "Save Cargo downloads cache", "Save compiler outputs cache"):
@@ -174,14 +193,23 @@ def main() -> None:
     require(build.count("continue-on-error: true") == 4, "cache service failures must not block a valid release")
     require(build.count("if: success() && steps.") == 4, "cache saves must remain success-only")
 
+    require(
+        '--method POST "repos/$GITHUB_REPOSITORY/git/refs"' not in publish,
+        "gh release create already creates the source tag; publication must not create it twice",
+    )
+    require(
+        '"repos/$GITHUB_REPOSITORY/releases/tags/$TAG"' not in publish,
+        "draft releases cannot be resolved through the public tag endpoint",
+    )
+
     publish_order = (
         publish.index("Download verified build handoff"),
         publish.index("Verify release assets"),
         publish.index("Create draft and publish prerelease"),
         publish.index("gh release create"),
-        publish.index("--method POST \"repos/$GITHUB_REPOSITORY/git/refs\""),
         publish.index("RELEASE_JSON="),
         publish.index("git/ref/tags/$TAG", publish.index("RELEASE_JSON=")),
+        publish.index("RELEASES_FILE="),
         publish.index("draft=false"),
     )
     require(list(publish_order) == sorted(publish_order), "publication boundary steps are out of order")
