@@ -159,6 +159,8 @@ pub async fn save_custom_harness(
         availability,
         command: command_opt,
         binary_path,
+        runtime_plan_id: None,
+        runtime_plan_source: None,
         default_args,
         mcp_command: None,
         model_env_var: None,
