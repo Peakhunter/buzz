@@ -216,11 +216,23 @@ jobs:
         run: |
           cat > desktop/src-tauri/tauri.test-release.conf.json <<'JSON'
           {
+            "productName": "Buzz Test Release",
+            "identifier": "xyz.block.buzz.app.dev.test-release",
             "bundle": {
               "macOS": {
                 "minimumSystemVersion": "10.15"
               },
               "createUpdaterArtifacts": false
+            },
+            "plugins": {
+              "updater": {
+                "endpoints": []
+              },
+              "deep-link": {
+                "desktop": {
+                  "schemes": ["buzz-test-release"]
+                }
+              }
             }
           }
           JSON
@@ -268,6 +280,7 @@ jobs:
       - name: Build unsigned Tauri app
         run: cd desktop && pnpm tauri build --verbose --no-sign --features mesh-llm --config src-tauri/tauri.test-release.conf.json
         env:
+          BUZZ_BUILD_CANDIDATE_ID: test-release
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           MACOSX_DEPLOYMENT_TARGET: "10.15"
           CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
@@ -284,8 +297,13 @@ jobs:
           VERSION: ${{ steps.identity.outputs.version }}
         run: |
           set -euo pipefail
-          APP="desktop/src-tauri/target/release/bundle/macos/Buzz.app"
-          [[ -d "$APP" ]] || { echo "::error::Buzz.app was not produced"; exit 1; }
+          APP="desktop/src-tauri/target/release/bundle/macos/Buzz Test Release.app"
+          [[ -d "$APP" ]] || { echo "::error::isolated Buzz Test Release.app was not produced"; exit 1; }
+
+          APP_NAME=$(basename "$APP")
+          [[ "$APP_NAME" == "Buzz Test Release.app" ]] || { echo "::error::unexpected app name: $APP_NAME"; exit 1; }
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")
+          [[ "$BUNDLE_ID" == "xyz.block.buzz.app.dev.test-release" ]] || { echo "::error::unexpected bundle identifier: $BUNDLE_ID"; exit 1; }
 
           EXECUTABLE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")
           EXECUTABLE="$APP/Contents/MacOS/$EXECUTABLE_NAME"
@@ -296,7 +314,22 @@ jobs:
             exit 1
           fi
 
-          ARCHIVE_NAME="Buzz_test_${SHORT_SHA}_macos-arm64_unsigned.zip"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path("desktop/src-tauri/tauri.test-release.conf.json").read_text(encoding="utf-8"))
+          assert config["productName"] == "Buzz Test Release"
+          assert config["identifier"] == "xyz.block.buzz.app.dev.test-release"
+          assert config["bundle"]["createUpdaterArtifacts"] is False
+          assert config["plugins"]["updater"]["endpoints"] == []
+          assert config["plugins"]["deep-link"]["desktop"]["schemes"] == ["buzz-test-release"]
+          PY
+
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          ARCHIVE_NAME="Buzz_test_${SHORT_SHA}_macos-arm64_adhoc.zip"
           HANDOFF_NAME="buzz-test-${SOURCE_SHA}"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/$ARCHIVE_NAME"
 
@@ -314,8 +347,16 @@ jobs:
               "version": os.environ["VERSION"],
               "architecture": "aarch64-apple-darwin",
               "archive": os.environ["ARCHIVE_NAME"],
-              "signed": False,
+              "signed": True,
+              "signing": "ad_hoc",
               "notarized": False,
+              "app_name": "Buzz Test Release.app",
+              "bundle_identifier": "xyz.block.buzz.app.dev.test-release",
+              "candidate_id": "test-release",
+              "keyring_service": "buzz-desktop-candidate.test-release",
+              "state_root": "~/.buzz-candidate-test-release",
+              "deep_link_scheme": "buzz-test-release",
+              "updater_enabled": False,
               "workflow_sha": os.environ["GITHUB_SHA"],
               "run_id": os.environ["GITHUB_RUN_ID"],
           }
@@ -462,8 +503,16 @@ jobs:
               "version": os.environ["VERSION"],
               "architecture": "aarch64-apple-darwin",
               "archive": os.environ["ARCHIVE_NAME"],
-              "signed": False,
+              "signed": True,
+              "signing": "ad_hoc",
               "notarized": False,
+              "app_name": "Buzz Test Release.app",
+              "bundle_identifier": "xyz.block.buzz.app.dev.test-release",
+              "candidate_id": "test-release",
+              "keyring_service": "buzz-desktop-candidate.test-release",
+              "state_root": "~/.buzz-candidate-test-release",
+              "deep_link_scheme": "buzz-test-release",
+              "updater_enabled": False,
               "workflow_sha": os.environ["WORKFLOW_SHA"],
               "run_id": os.environ["EXPECTED_RUN_ID"],
           }
@@ -493,13 +542,13 @@ jobs:
           fi
 
           NOTES=$(printf '%s\n' \
-            "Unsigned Buzz test build." \
+            "Ad-hoc signed, non-notarized Buzz test build." \
             "" \
             "Source: $SOURCE_SHA" \
             "Version: $VERSION" \
             "Architecture: Apple Silicon (aarch64)" \
             "" \
-            "This is a test prerelease. It is not signed, notarized, or approved for production release.")
+            "This is an isolated test prerelease. It is ad-hoc signed, not notarized, and not approved for production release.")
 
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
@@ -528,7 +577,7 @@ jobs:
           if release["targetCommitish"] != os.environ["SOURCE_SHA"]:
               raise SystemExit("release target does not match source SHA")
           expected = {
-              f"Buzz_test_{os.environ['SHORT_SHA']}_macos-arm64_unsigned.zip",
+              f"Buzz_test_{os.environ['SHORT_SHA']}_macos-arm64_adhoc.zip",
               "manifest.json",
               "SHA256SUMS.txt",
           }

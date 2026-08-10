@@ -107,7 +107,21 @@ def main() -> None:
         "restore-keys:",
         "Build unsigned Tauri app",
         "cd desktop\n          node scripts/set-version-from-tag.mjs",
+        '"productName": "Buzz Test Release"',
+        '"identifier": "xyz.block.buzz.app.dev.test-release"',
+        '"schemes": ["buzz-test-release"]',
+        "BUZZ_BUILD_CANDIDATE_ID: test-release",
+        '"endpoints": []',
         "createUpdaterArtifacts\": false",
+        'APP="desktop/src-tauri/target/release/bundle/macos/Buzz Test Release.app"',
+        "codesign --force --deep --sign -",
+        "codesign --verify --deep --strict",
+        '"signed": True',
+        '"signing": "ad_hoc"',
+        '"candidate_id": "test-release"',
+        '"keyring_service": "buzz-desktop-candidate.test-release"',
+        '"state_root": "~/.buzz-candidate-test-release"',
+        '"updater_enabled": False',
         "manifest.json",
         "SHA256SUMS.txt",
         "unexpected handoff files",
@@ -128,12 +142,13 @@ def main() -> None:
         "draft=false",
         "names != expected",
         "Buzz_test_",
+        "macos-arm64_adhoc.zip",
     )
     for fragment in required_fragments:
         require(fragment in text, f"workflow is missing required contract fragment: {fragment}")
 
     require("retention-days: 1" in build, "internal handoff artifact must be short-lived")
-    require('"signed": False' in build, "manifest generator must disclose unsigned status")
+    require('"signed": True' in build, "manifest generator must disclose ad-hoc signed status")
     require("$GITHUB_STEP_SUMMARY" in text, "cache and release telemetry must be summarized")
     require("id: cache_keys" in build, "cache keys must be frozen before build-time lockfile changes")
     require(
