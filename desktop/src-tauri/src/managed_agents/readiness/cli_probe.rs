@@ -58,10 +58,35 @@ pub(crate) fn login_probe(
     probe_args: &[&str],
     augmented_path: Option<&str>,
 ) -> ProbeOutcome {
+    login_probe_inner(binary_path, probe_args, augmented_path, None)
+}
+
+pub(crate) fn login_probe_with_runtime_plan(
+    binary_path: &Path,
+    probe_args: &[&str],
+    runtime_plan: &crate::managed_agents::runtime_plan::RuntimeExecutionPlan,
+) -> ProbeOutcome {
+    login_probe_inner(
+        binary_path,
+        probe_args,
+        runtime_plan.generated_environment("PATH"),
+        Some(runtime_plan),
+    )
+}
+
+fn login_probe_inner(
+    binary_path: &Path,
+    probe_args: &[&str],
+    augmented_path: Option<&str>,
+    runtime_plan: Option<&crate::managed_agents::runtime_plan::RuntimeExecutionPlan>,
+) -> ProbeOutcome {
     let mut command = std::process::Command::new(binary_path);
     command.args(&probe_args[1..]);
     if let Some(path) = augmented_path {
         command.env("PATH", path);
+    }
+    if let Some(plan) = runtime_plan {
+        plan.apply_environment(&mut command);
     }
     crate::util::configure_no_window(&mut command);
 
