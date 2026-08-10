@@ -82,7 +82,7 @@ pub(crate) struct EffectiveAgentEnv {
 //
 // A single owned type that fully describes what a spawn would run.  Produced
 // by `resolve_effective_harness_descriptor` and consumed by spawn_agent_child,
-// spawn_config_hash, build_managed_agent_summary, get_agent_models, and
+// spawn_snapshot, build_managed_agent_summary, get_agent_models, and
 // agent_readiness — so the harness-definition lookup and arg/env resolution
 // happen exactly once, in one place.
 
@@ -1051,19 +1051,16 @@ mod tests {
             thinking_env_var: None,
             max_tokens_env_var: None,
             context_limit_env_var: None,
+            max_rounds_env_var: None,
             required_normalized_fields: &[],
             login_hint: None,
             auth_probe_args: None,
         }
     }
 
-    /// Returns the absolute path of the currently-running test binary as a
-    /// `&'static str`.  Host-portable stand-in for a "present" binary:
-    /// the path is absolute so `find_command` resolves it via `path.exists()`
-    /// rather than searching `PATH`, and the file always exists on the host.
-    ///
-    /// The tiny allocation is intentionally leaked — this runs at most once per
-    /// test process and the process exits immediately after tests complete.
+    /// Returns the absolute path of the currently-running test binary as a `&'static str`.
+    /// Host-portable stand-in for a "present" binary: absolute path so `find_command` resolves
+    /// it via `path.exists()`. Leaked allocation is intentional — process exits after tests.
     fn present_binary_str() -> &'static str {
         let path = std::env::current_exe().expect("current_exe must be available in tests");
         Box::leak(path.to_string_lossy().into_owned().into_boxed_str())
@@ -1246,6 +1243,7 @@ mod tests {
             thinking_env_var: None,
             max_tokens_env_var: None,
             context_limit_env_var: None,
+            max_rounds_env_var: None,
             required_normalized_fields: &[],
             login_hint: None,
             auth_probe_args: None,
@@ -1286,11 +1284,10 @@ mod tests {
         crate::managed_agents::clear_resolve_cache();
     }
 
-    /// Codex readiness: outdated adapter (exits non-zero) → AdapterOutdated,
-    /// login probe skipped.
+    /// Thin-v6 refuses a shell adapter before running its version probe.
     #[cfg(unix)]
     #[test]
-    fn cli_login_requirements_codex_outdated_adapter_emits_adapter_outdated() {
+    fn cli_login_requirements_codex_shell_adapter_emits_plan_invalid() {
         let _guard = crate::managed_agents::lock_path_mutex();
 
         let (dir, orig) = setup_temp_codex_acp("#!/bin/sh\nexit 1\n");
@@ -1313,27 +1310,20 @@ mod tests {
 
         assert!(
             !reqs.is_empty(),
-            "outdated codex adapter must produce a requirement; got {reqs:?}"
+            "unsupported codex adapter must produce a requirement; got {reqs:?}"
         );
-        if let Requirement::CliLogin {
-            ref availability, ..
-        } = reqs[0]
-        {
-            assert_eq!(
-                *availability,
-                crate::managed_agents::AcpAvailabilityStatus::AdapterOutdated,
-                "0.x codex adapter must yield AdapterOutdated; got {availability:?}"
-            );
-        } else {
-            panic!("expected CliLogin requirement; got {:?}", reqs[0]);
-        }
+        assert!(
+            matches!(&reqs[0], Requirement::CliConfigInvalid { diagnostic, .. }
+                if diagnostic.contains("supported Node runtime")),
+            "unsupported shell adapter must fail at the plan boundary; got {:?}",
+            reqs[0]
+        );
     }
 
-    /// Codex readiness: adapter exits 0 but output is not a parseable version
-    /// → AdapterOutdated (garbage output treated as outdated, same as non-zero).
+    /// Unsupported launchers are refused before their output can influence readiness.
     #[cfg(unix)]
     #[test]
-    fn cli_login_requirements_codex_garbage_version_output_emits_adapter_outdated() {
+    fn cli_login_requirements_codex_shell_garbage_output_emits_plan_invalid() {
         let _guard = crate::managed_agents::lock_path_mutex();
 
         let (dir, orig) = setup_temp_codex_acp("#!/bin/sh\necho 'not a version string'\nexit 0\n");
@@ -1355,18 +1345,12 @@ mod tests {
             !reqs.is_empty(),
             "garbage version output must produce a requirement; got {reqs:?}"
         );
-        if let Requirement::CliLogin {
-            ref availability, ..
-        } = reqs[0]
-        {
-            assert_eq!(
-                *availability,
-                crate::managed_agents::AcpAvailabilityStatus::AdapterOutdated,
-                "unparseable version output must yield AdapterOutdated; got {availability:?}"
-            );
-        } else {
-            panic!("expected CliLogin requirement; got {:?}", reqs[0]);
-        }
+        assert!(
+            matches!(&reqs[0], Requirement::CliConfigInvalid { diagnostic, .. }
+                if diagnostic.contains("supported Node runtime")),
+            "unsupported shell adapter must fail at the plan boundary; got {:?}",
+            reqs[0]
+        );
     }
 
     // ── custom/unknown command ─────────────────────────────────────────────

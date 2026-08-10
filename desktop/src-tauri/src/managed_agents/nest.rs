@@ -67,6 +67,16 @@ const NEST_DIR_PROD: &str = ".buzz";
 /// `.repos-dir` dotfile and `REPOS` symlink.
 const NEST_DIR_DEV: &str = ".buzz-dev";
 
+fn configured_nest_suffix(is_dev: bool) -> String {
+    if let Some(candidate_id) = option_env!("BUZZ_DESKTOP_BUILD_CANDIDATE_ID") {
+        format!(".buzz-candidate-{candidate_id}")
+    } else if is_dev {
+        NEST_DIR_DEV.to_string()
+    } else {
+        NEST_DIR_PROD.to_string()
+    }
+}
+
 /// Process-lifetime nest directory. Initialized once at startup via
 /// [`init_nest_dir`] before any call to [`nest_dir`].
 ///
@@ -86,7 +96,7 @@ static NEST_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new
 /// when the Tauri app-data directory name starts with `"xyz.block.buzz.app.dev"`.
 /// Pass `false` for production (signed DMG) builds.
 pub fn init_nest_dir(is_dev: bool) {
-    let suffix = if is_dev { NEST_DIR_DEV } else { NEST_DIR_PROD };
+    let suffix = configured_nest_suffix(is_dev);
     let path = dirs::home_dir().map(|h| h.join(suffix));
     // set() is a no-op when already initialized, which is correct: only the
     // first call (at boot, before any filesystem work) should win.
@@ -102,33 +112,8 @@ pub fn nest_dir() -> Option<PathBuf> {
     match NEST_DIR.get() {
         Some(path) => path.clone(),
         // Not yet initialized — fall back to prod path. Covers test code.
-        None => dirs::home_dir().map(|h| h.join(NEST_DIR_PROD)),
+        None => dirs::home_dir().map(|h| h.join(configured_nest_suffix(false))),
     }
-}
-
-/// Returns `true` iff `path` ends with the dev-nest directory name (`.buzz-dev`).
-///
-/// Pure function — no globals — so it can be unit-tested without touching the
-/// process-lifetime [`NEST_DIR`] `OnceLock`.
-fn path_is_dev_nest(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n == NEST_DIR_DEV)
-        .unwrap_or(false)
-}
-
-/// Returns `true` when the running binary is using the dev nest (`~/.buzz-dev`).
-///
-/// This is `true` for all dev builds — `just staging` and `just dev` — because
-/// [`init_nest_dir`] is called with `is_dev = true` when the Tauri app-data
-/// directory starts with `"xyz.block.buzz.app.dev"`.
-///
-/// Returns `false` when:
-/// - The nest is the production nest (`~/.buzz`, signed DMG).
-/// - [`init_nest_dir`] has not been called yet (unit tests, home dir
-///   unresolvable) — the fallback path is always the prod nest.
-pub fn nest_is_dev() -> bool {
-    nest_dir().map(|p| path_is_dev_nest(&p)).unwrap_or(false)
 }
 
 /// Creates the Buzz nest at `~/.buzz` if it doesn't already exist.
