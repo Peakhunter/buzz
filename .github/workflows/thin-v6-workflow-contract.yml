@@ -1,0 +1,22 @@
+name: Thin v6 workflow contract
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/thin-v6-macos-arm64.yml
+      - .github/workflows/thin-v6-workflow-contract.yml
+      - scripts/test-thin-v6-workflow-efficiency.sh
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Thin v6 workflow efficiency contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - run: scripts/test-thin-v6-workflow-efficiency.sh

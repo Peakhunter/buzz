@@ -13,9 +13,19 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text(encoding="utf-8")
-ci_text = (path.parent / "ci.yml").read_text(encoding="utf-8")
-if "scripts/test-thin-v6-workflow-efficiency.sh" not in ci_text:
-    raise SystemExit("source CI must run the thin-v6 workflow efficiency contract")
+contract_path = path.parent / "thin-v6-workflow-contract.yml"
+if not contract_path.exists():
+    raise SystemExit("path-scoped thin-v6 workflow contract is missing")
+contract_text = contract_path.read_text(encoding="utf-8")
+if "scripts/test-thin-v6-workflow-efficiency.sh" not in contract_text:
+    raise SystemExit("path-scoped CI must run the thin-v6 workflow efficiency contract")
+for changed_path in (
+    ".github/workflows/thin-v6-macos-arm64.yml",
+    ".github/workflows/thin-v6-workflow-contract.yml",
+    "scripts/test-thin-v6-workflow-efficiency.sh",
+):
+    if changed_path not in contract_text:
+        raise SystemExit(f"path-scoped CI trigger is missing {changed_path}")
 
 
 def require(pattern: str, message: str, *, flags: int = 0) -> None:
