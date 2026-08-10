@@ -475,7 +475,15 @@ export function formatRuntimeOptionLabel(runtime: AcpRuntimeCatalogEntry) {
           ? " (CLI missing)"
           : runtime.availability === "not_installed"
             ? " (not installed)"
-            : "";
+            : runtime.runtimePlanSource === "verified_external" &&
+                runtime.runtimePlanId
+              ? ` (verified external · ${runtime.runtimePlanId.slice(0, 12)})`
+              : runtime.runtimePlanSource === "managed" &&
+                  runtime.runtimePlanId
+                ? ` (managed adapter · ${runtime.runtimePlanId.slice(0, 12)})`
+                : runtime.runtimePlanSource === "bundled" && runtime.runtimePlanId
+                  ? ` (bundled · ${runtime.runtimePlanId.slice(0, 12)})`
+                  : "";
   return `${runtime.label}${suffix}`;
 }
 

@@ -509,6 +509,10 @@ export type AcpRuntimeCatalogEntry = {
   availability: AcpAvailabilityStatus;
   command: string | null;
   binaryPath: string | null;
+  /** Content-derived identity consumed by known runtime operations. */
+  runtimePlanId?: string;
+  /** Runtime byte source selected by the execution plan. */
+  runtimePlanSource?: "bundled" | "managed" | "verified_external";
   defaultArgs: string[];
   mcpCommand: string | null;
   /** Environment variable used to apply the initial model, when supported. */

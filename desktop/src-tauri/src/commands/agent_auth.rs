@@ -113,11 +113,33 @@ fn run_buzz_acp_auth_command<const N: usize>(
 ) -> Result<std::process::Output, String> {
     let runtime = known_acp_runtime_exact(runtime_id)
         .ok_or_else(|| format!("unknown ACP runtime: {runtime_id}"))?;
-    let adapter_command = runtime
-        .commands
-        .iter()
-        .find_map(|command| resolve_command(command).map(|path| (*command, path)))
-        .ok_or_else(|| format!("{} ACP adapter is not installed", runtime.label))?;
+    let (adapter_name, adapter_path, runtime_plan) = if runtime.id == "codex" && !cfg!(windows) {
+        let mut planned_runtime = None;
+        let mut last_plan_error = None;
+        for adapter_name in runtime.commands {
+            match crate::managed_agents::runtime_plan::resolve_runtime_execution_plan(adapter_name) {
+                Ok(Some(plan)) => {
+                    planned_runtime = Some((*adapter_name, plan));
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => last_plan_error = Some(error),
+            }
+        }
+        let (adapter_name, plan) = planned_runtime.ok_or_else(|| {
+            last_plan_error
+                .unwrap_or_else(|| format!("{} ACP adapter is not installed", runtime.label))
+        })?;
+        let adapter_path = plan.harness_path()?.to_path_buf();
+        (adapter_name, adapter_path, Some(plan))
+    } else {
+        let (adapter_name, adapter_path) = runtime
+            .commands
+            .iter()
+            .find_map(|command| resolve_command(command).map(|path| (*command, path)))
+            .ok_or_else(|| format!("{} ACP adapter is not installed", runtime.label))?;
+        (adapter_name, adapter_path, None)
+    };
 
     let acp_path = std::env::current_exe()
         .map(|path| path.with_file_name(format!("buzz-acp{}", std::env::consts::EXE_SUFFIX)))
@@ -129,10 +151,11 @@ fn run_buzz_acp_auth_command<const N: usize>(
     let augmented_path = auth_command_path();
     run_buzz_acp_auth_command_with_paths(
         &acp_path,
-        adapter_command.0,
-        &adapter_command.1,
+        adapter_name,
+        &adapter_path,
         args,
         augmented_path.as_deref(),
+        runtime_plan.as_ref(),
     )
 }
 
@@ -179,6 +202,7 @@ fn run_buzz_acp_auth_command_with_paths<const N: usize>(
     adapter_path: &Path,
     args: [&str; N],
     augmented_path: Option<&str>,
+    runtime_plan: Option<&crate::managed_agents::runtime_plan::RuntimeExecutionPlan>,
 ) -> Result<std::process::Output, String> {
     let agent_args = normalize_agent_args(adapter_name, Vec::new());
     let mut command = Command::new(acp_path);
@@ -193,6 +217,10 @@ fn run_buzz_acp_auth_command_with_paths<const N: usize>(
     }
     if let Some(path) = augmented_path {
         command.env("PATH", path);
+    }
+    if let Some(plan) = runtime_plan {
+        plan.verify()?;
+        plan.apply_environment(&mut command);
     }
     crate::util::configure_no_window(&mut command);
 
@@ -254,9 +282,47 @@ fn launch_terminal_auth(runtime_id: &str, method: &AcpAuthMethod) -> Result<(), 
         .iter()
         .find_map(|command| resolve_command(command).map(|path| (*command, path)))
         .ok_or_else(|| format!("{} ACP adapter is not installed", runtime.label))?;
+    let runtime_plan = if runtime.id == "codex" {
+        crate::managed_agents::runtime_plan::resolve_runtime_execution_plan(adapter_command.0)?
+    } else {
+        None
+    };
     let fallback_command = adapter_command.1.display().to_string();
-    let argv = adapter_terminal_argv(runtime.label, method, &fallback_command)?;
-    launch_visible_terminal(&argv)
+    let mut argv = adapter_terminal_argv(runtime.label, method, &fallback_command)?;
+    if let Some(plan) = runtime_plan.as_ref() {
+        let provider_path = plan
+            .provider_cli_path()
+            .ok_or_else(|| "Codex runtime plan has no provider CLI".to_string())?;
+        let command = argv
+            .first_mut()
+            .ok_or_else(|| "Codex terminal login command is empty".to_string())?;
+        *command = provider_path.display().to_string();
+        plan.verify()?;
+    }
+    let terminal_prelude = runtime_plan
+        .as_ref()
+        .map(runtime_plan_shell_prelude)
+        .unwrap_or_default();
+    launch_visible_terminal(&argv, &terminal_prelude)
+}
+
+fn runtime_plan_shell_prelude(
+    plan: &crate::managed_agents::runtime_plan::RuntimeExecutionPlan,
+) -> String {
+    let mut prelude = String::new();
+    for key in plan.denied_environment() {
+        prelude.push_str("unset ");
+        prelude.push_str(key);
+        prelude.push('\n');
+    }
+    for (key, value) in plan.generated_environment_entries() {
+        prelude.push_str("export ");
+        prelude.push_str(key);
+        prelude.push('=');
+        prelude.push_str(&shell_escape(value));
+        prelude.push('\n');
+    }
+    prelude
 }
 
 fn adapter_terminal_argv(
@@ -361,7 +427,7 @@ fn spawn_without_stdio(mut command: Command) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
+fn launch_visible_terminal(argv: &[String], shell_prelude: &str) -> Result<(), String> {
     let mut script = tempfile::Builder::new()
         .prefix("buzz-auth-")
         .suffix(".command")
@@ -369,7 +435,8 @@ fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
         .map_err(|error| format!("failed to create terminal login script: {error}"))?;
     writeln!(
         script,
-        "#!/bin/sh\ntrap 'rm -f -- \"$0\"' EXIT\n{}",
+        "#!/bin/sh\ntrap 'rm -f -- \"$0\"' EXIT\n{}{}",
+        shell_prelude,
         shell_join(argv)
     )
     .map_err(|error| format!("failed to write terminal login script: {error}"))?;
@@ -395,8 +462,8 @@ fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
-    let command = shell_join(argv);
+fn launch_visible_terminal(argv: &[String], shell_prelude: &str) -> Result<(), String> {
+    let command = format!("{}{}", shell_prelude, shell_join(argv));
     let candidates: [(&str, &[&str]); 4] = [
         ("x-terminal-emulator", &["-e", "sh", "-lc"]),
         ("gnome-terminal", &["--", "sh", "-lc"]),
@@ -414,7 +481,7 @@ fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
+fn launch_visible_terminal(argv: &[String], _shell_prelude: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
@@ -436,7 +503,7 @@ fn windows_terminal_args(argv: &[String]) -> Vec<String> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn launch_visible_terminal(_argv: &[String]) -> Result<(), String> {
+fn launch_visible_terminal(_argv: &[String], _shell_prelude: &str) -> Result<(), String> {
     Err("opening a terminal is not supported on this platform".to_string())
 }
 
@@ -542,6 +609,7 @@ mod tests {
             &adapter_path,
             ["auth-methods", "--json"],
             Some(&augmented_path),
+            None,
         )
         .expect("run auth command");
 

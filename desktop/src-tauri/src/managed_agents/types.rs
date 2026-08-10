@@ -634,6 +634,12 @@ pub struct AcpRuntimeCatalogEntry {
     pub availability: AcpAvailabilityStatus,
     pub command: Option<String>,
     pub binary_path: Option<String>,
+    /// Content-derived execution plan identity for known runtimes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_plan_id: Option<String>,
+    /// Selected runtime-byte source (`bundled`, `managed`, or `verified_external`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_plan_source: Option<String>,
     pub default_args: Vec<String>,
     pub mcp_command: Option<String>,
     /// Environment variable used to apply the initial model, when supported.

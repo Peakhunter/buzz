@@ -31,6 +31,7 @@ mod repos;
 mod restore;
 pub mod retention;
 mod runtime;
+pub(crate) mod runtime_plan;
 mod runtime_commands;
 mod runtime_types;
 pub(crate) mod snapshot_avatar;

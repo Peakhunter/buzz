@@ -1,0 +1,305 @@
+name: Thin v6 macOS ARM64 candidate
+
+on:
+  push:
+    branches:
+      - feat/thin-v6-runtime-plan
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: thin-v6-macos-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build isolated thin v6 Buzz.app
+    if: github.repository == 'Peakhunter/buzz'
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      TARGET: aarch64-apple-darwin
+      CANDIDATE_ID: thin-v6
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+      CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+    steps:
+      - name: Verify free standard Apple Silicon runner
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$RUNNER_ARCH" = ARM64
+          sw_vers
+
+      - name: Check out exact candidate source
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Activate repository-pinned Hermit toolchain
+        uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Add exact Rust target
+        run: rustup target add "$TARGET"
+
+      - name: Resolve pnpm store
+        id: pnpm-cache
+        run: echo "store=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pnpm store cache
+        id: pnpm-restore
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.pnpm-cache.outputs.store }}
+          key: thin-v6-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install lockfile-pinned desktop dependencies
+        run: just desktop-install-ci
+
+      - name: Resolve native toolchain identity
+        id: native-toolchain
+        run: echo "id=$(scripts/desktop-native-toolchain-id.sh macos)" >> "$GITHUB_OUTPUT"
+
+      - name: Compute exact release Cargo cache key
+        id: cargo-key
+        env:
+          NATIVE_TOOLCHAIN_ID: ${{ steps.native-toolchain.outputs.id }}
+        run: |
+          set -euo pipefail
+          key=$(scripts/desktop-release-cache-key.py \
+            --platform "$RUNNER_OS" \
+            --target "$TARGET" \
+            --features default \
+            --native-inputs "$NATIVE_TOOLCHAIN_ID")
+          echo "key=thin-v6-$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore exact Cargo cache
+        id: cargo-restore
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            desktop/src-tauri/target
+            !desktop/src-tauri/target/**/release/bundle
+          key: ${{ steps.cargo-key.outputs.key }}
+
+      - name: Generate isolated non-updating candidate config
+        env:
+          CANDIDATE_VERSION: 0.6.0-beta.${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          config = {
+              "productName": "Buzz v6 Candidate",
+              "version": os.environ["CANDIDATE_VERSION"],
+              "identifier": "xyz.block.buzz.app.dev.thinv6",
+              "bundle": {
+                  "createUpdaterArtifacts": False,
+                  "macOS": {"minimumSystemVersion": "10.15"},
+              },
+              "plugins": {
+                  "updater": {"endpoints": []},
+                  "deep-link": {"desktop": {"schemes": ["buzz-v6-candidate"]}},
+              },
+          }
+          with open("desktop/src-tauri/tauri.thin-v6.conf.json", "w", encoding="utf-8") as handle:
+              json.dump(config, handle, sort_keys=True, separators=(",", ":"))
+              handle.write("\n")
+          PY
+
+      - name: Build only the small bundled Buzz sidecar baseline
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET" \
+            -p buzz-acp \
+            -p buzz-agent \
+            -p buzz-backend-kubernetes \
+            -p buzz-dev-mcp \
+            -p git-credential-nostr \
+            -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+
+      - name: Verify thin-v6 source gates
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          pnpm --dir desktop typecheck
+          pnpm --dir desktop test
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib
+
+      - name: Build unsigned ARM64 app bundle
+        env:
+          BUZZ_BUILD_CANDIDATE_ID: thin-v6
+        run: |
+          set -euo pipefail
+          cd desktop
+          pnpm tauri build \
+            --verbose \
+            --no-sign \
+            --target "$TARGET" \
+            --bundles app \
+            --config src-tauri/tauri.thin-v6.conf.json
+
+      - name: Ad-hoc sign and verify isolated app
+        id: app
+        run: |
+          set -euo pipefail
+          APP="desktop/src-tauri/target/${TARGET}/release/bundle/macos/Buzz v6 Candidate.app"
+          test -d "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")
+          test "$(lipo -archs "$APP/Contents/MacOS/$executable")" = arm64
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = xyz.block.buzz.app.dev.thinv6
+          echo "path=$APP" >> "$GITHUB_OUTPUT"
+
+      - name: Prove Codex family is not bundled
+        env:
+          APP_PATH: ${{ steps.app.outputs.path }}
+        run: |
+          set -euo pipefail
+          matches=$(find "$APP_PATH" -iname '*codex*' -print)
+          if [[ -n "$matches" ]]; then
+            echo "::error::Thin v6 app unexpectedly contains Codex-family paths"
+            printf '%s\n' "$matches"
+            exit 1
+          fi
+
+      - name: Package ZIP, manifest, and SHA-256 hashes
+        env:
+          APP_PATH: ${{ steps.app.outputs.path }}
+          CANONICAL_BASE_SHA: 119a84897f225c1e3213a09cd149abb37dcb3abc
+          ADR_ANCHOR_SHA: 5be4a45a7c0c8a60cee3eb4273e2a425b4122b43
+          CHECKOUT_ACTION_SHA: 9f698171ed81b15d1823a05fc7211befd50c8ae0
+          HERMIT_ACTION_SHA: cea9af7913204a965fd488637a8d1811bba2e616
+          CACHE_ACTION_SHA: caa296126883cff596d87d8935842f9db880ef25
+          UPLOAD_ACTION_SHA: 043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/thin-v6-artifact"
+          mkdir -p "$OUT"
+          ZIP="$OUT/Buzz-v6-candidate-arm64-${GITHUB_SHA}.zip"
+          ditto -c -k --keepParent "$APP_PATH" "$ZIP"
+          export OUT ZIP
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, subprocess
+
+          app = pathlib.Path(os.environ["APP_PATH"])
+          out = pathlib.Path(os.environ["OUT"])
+          archive = pathlib.Path(os.environ["ZIP"])
+
+          def digest(path):
+              h = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          files = []
+          codex_paths = []
+          for path in sorted(candidate for candidate in app.rglob("*") if candidate.is_file()):
+              relative = path.relative_to(app).as_posix()
+              if "codex" in relative.lower():
+                  codex_paths.append(relative)
+              files.append({
+                  "path": relative,
+                  "bytes": path.stat().st_size,
+                  "sha256": digest(path),
+              })
+
+          manifest = {
+              "schema": "org.peakhunter.buzz.thin-v6-candidate.v1",
+              "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "source": {
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+                  "commit": os.environ["GITHUB_SHA"],
+                  "canonical_base": os.environ["CANONICAL_BASE_SHA"],
+                  "adr_anchor": os.environ["ADR_ANCHOR_SHA"],
+                  "ref": os.environ["GITHUB_REF"],
+              },
+              "builder": {
+                  "workflow": os.environ["GITHUB_WORKFLOW"],
+                  "run_id": os.environ["GITHUB_RUN_ID"],
+                  "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                  "runner": "macos-26",
+                  "runner_arch": os.environ["RUNNER_ARCH"],
+                  "target": os.environ["TARGET"],
+                  "actions": {
+                      "actions/checkout": os.environ["CHECKOUT_ACTION_SHA"],
+                      "cashapp/activate-hermit": os.environ["HERMIT_ACTION_SHA"],
+                      "actions/cache": os.environ["CACHE_ACTION_SHA"],
+                      "actions/upload-artifact": os.environ["UPLOAD_ACTION_SHA"],
+                  },
+              },
+              "app": {
+                  "name": app.name,
+                  "bundle_identifier": "xyz.block.buzz.app.dev.thinv6",
+                  "architecture": "arm64",
+                  "signing": "ad_hoc",
+                  "isolated_keyring_service": "buzz-desktop-candidate.thin-v6",
+                  "isolated_nest": "~/.buzz-candidate-thin-v6",
+                  "files": files,
+              },
+              "archive": {
+                  "name": archive.name,
+                  "bytes": archive.stat().st_size,
+                  "sha256": digest(archive),
+              },
+              "codex_family": {
+                  "bundled": False,
+                  "matching_paths": codex_paths,
+                  "policy": "verified existing runtime or explicit user-selected installation",
+              },
+              "gates": {
+                  "build": "completed",
+                  "artifact_verification": "pending independent download",
+                  "isolated_mac_ui_acceptance": "pending",
+                  "review": "pending",
+                  "signing": "not requested (ad hoc only)",
+                  "installation": "prohibited",
+                  "release": "prohibited",
+              },
+          }
+          with (out / "manifest.json").open("w", encoding="utf-8") as handle:
+              json.dump(manifest, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          PY
+          cd "$OUT"
+          shasum -a 256 "$(basename "$ZIP")" manifest.json > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      - name: Upload one-day verification artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: thin-v6-macos-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/thin-v6-artifact/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Save exact Cargo cache
+        if: steps.cargo-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            desktop/src-tauri/target
+            !desktop/src-tauri/target/**/release/bundle
+          key: ${{ steps.cargo-key.outputs.key }}
+
+      - name: Save pnpm store cache
+        if: steps.pnpm-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.pnpm-cache.outputs.store }}
+          key: thin-v6-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml') }}

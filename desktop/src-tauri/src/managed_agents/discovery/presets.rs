@@ -59,6 +59,8 @@ pub(super) fn preset_catalog_entry(
         availability,
         command,
         binary_path,
+        runtime_plan_id: None,
+        runtime_plan_source: None,
         default_args: normalize_agent_args(
             def.command,
             def.args.iter().map(|arg| arg.to_string()).collect(),
