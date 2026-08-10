@@ -1284,11 +1284,10 @@ mod tests {
         crate::managed_agents::clear_resolve_cache();
     }
 
-    /// Codex readiness: outdated adapter (exits non-zero) → AdapterOutdated,
-    /// login probe skipped.
+    /// Thin-v6 refuses a shell adapter before running its version probe.
     #[cfg(unix)]
     #[test]
-    fn cli_login_requirements_codex_outdated_adapter_emits_adapter_outdated() {
+    fn cli_login_requirements_codex_shell_adapter_emits_plan_invalid() {
         let _guard = crate::managed_agents::lock_path_mutex();
 
         let (dir, orig) = setup_temp_codex_acp("#!/bin/sh\nexit 1\n");
@@ -1311,27 +1310,20 @@ mod tests {
 
         assert!(
             !reqs.is_empty(),
-            "outdated codex adapter must produce a requirement; got {reqs:?}"
+            "unsupported codex adapter must produce a requirement; got {reqs:?}"
         );
-        if let Requirement::CliLogin {
-            ref availability, ..
-        } = reqs[0]
-        {
-            assert_eq!(
-                *availability,
-                crate::managed_agents::AcpAvailabilityStatus::AdapterOutdated,
-                "0.x codex adapter must yield AdapterOutdated; got {availability:?}"
-            );
-        } else {
-            panic!("expected CliLogin requirement; got {:?}", reqs[0]);
-        }
+        assert!(
+            matches!(&reqs[0], Requirement::CliConfigInvalid { diagnostic, .. }
+                if diagnostic.contains("supported Node runtime")),
+            "unsupported shell adapter must fail at the plan boundary; got {:?}",
+            reqs[0]
+        );
     }
 
-    /// Codex readiness: adapter exits 0 but output is not a parseable version
-    /// → AdapterOutdated (garbage output treated as outdated, same as non-zero).
+    /// Unsupported launchers are refused before their output can influence readiness.
     #[cfg(unix)]
     #[test]
-    fn cli_login_requirements_codex_garbage_version_output_emits_adapter_outdated() {
+    fn cli_login_requirements_codex_shell_garbage_output_emits_plan_invalid() {
         let _guard = crate::managed_agents::lock_path_mutex();
 
         let (dir, orig) = setup_temp_codex_acp("#!/bin/sh\necho 'not a version string'\nexit 0\n");
@@ -1353,18 +1345,12 @@ mod tests {
             !reqs.is_empty(),
             "garbage version output must produce a requirement; got {reqs:?}"
         );
-        if let Requirement::CliLogin {
-            ref availability, ..
-        } = reqs[0]
-        {
-            assert_eq!(
-                *availability,
-                crate::managed_agents::AcpAvailabilityStatus::AdapterOutdated,
-                "unparseable version output must yield AdapterOutdated; got {availability:?}"
-            );
-        } else {
-            panic!("expected CliLogin requirement; got {:?}", reqs[0]);
-        }
+        assert!(
+            matches!(&reqs[0], Requirement::CliConfigInvalid { diagnostic, .. }
+                if diagnostic.contains("supported Node runtime")),
+            "unsupported shell adapter must fail at the plan boundary; got {:?}",
+            reqs[0]
+        );
     }
 
     // ── custom/unknown command ─────────────────────────────────────────────
