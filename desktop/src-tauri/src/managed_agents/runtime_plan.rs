@@ -651,8 +651,8 @@ fn plan_identity(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_package_files, component_identity, package_inventory, plan_identity,
-        RuntimeComponentRole, RuntimeExecutionPlan, RuntimePlanSource,
+        append_node_runtime_closure, collect_package_files, component_identity, package_inventory,
+        plan_identity, RuntimeComponentRole, RuntimeExecutionPlan, RuntimePlanSource,
         DENIED_EXECUTABLE_ENV,
     };
     use std::{collections::BTreeMap, fs};
@@ -721,6 +721,33 @@ mod tests {
         plan.verify().expect("approved bytes verify");
         fs::write(&path, b"drifted").expect("replace component");
         assert!(plan.verify().is_err());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn direct_node_shebang_is_rejected() {
+        let node = super::resolve_command("node").expect("Node available in the test toolchain");
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("package.json"), b"{}").expect("write package manifest");
+        let launcher = dir.path().join("launcher.js");
+        fs::write(&launcher, format!("#!{}\n", node.display())).expect("write launcher");
+        let mut components = Vec::new();
+        let mut packages = Vec::new();
+        let mut generated_env = BTreeMap::new();
+
+        let result = append_node_runtime_closure(
+            &launcher,
+            RuntimePlanSource::VerifiedExternal,
+            &mut components,
+            &mut packages,
+            &mut generated_env,
+        );
+
+        assert!(
+            result
+                .expect_err("direct interpreter shebang must fail closed")
+                .contains("direct Node interpreter")
+        );
     }
 
     #[test]
