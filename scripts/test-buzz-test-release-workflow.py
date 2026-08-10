@@ -131,6 +131,9 @@ def main() -> None:
         "actions/upload-artifact@",
         "actions/download-artifact@",
         "gh release create",
+        "--method POST \"repos/$GITHUB_REPOSITORY/git/refs\"",
+        "-f ref=\"refs/tags/$TAG\"",
+        "-f sha=\"$SOURCE_SHA\"",
         "--draft",
         "--prerelease",
         "--target \"$SOURCE_SHA\"",
@@ -177,15 +180,10 @@ def main() -> None:
         "mesh native cache must freeze OS, architecture, deployment target, toolchain, and dependency scope",
     )
     require(
-        "NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'bin/.cmake-*.pkg') }}" in build,
-        "mesh native cache scope must not be invalidated by unrelated Cargo lockfile changes",
+        "NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'bin/.cmake-*.pkg') }}" in build,
+        "mesh native cache scope must include the source dependency lockfile",
     )
-    require(
-        "LEGACY_NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'bin/.cmake-*.pkg') }}" in build
-        and "mesh_legacy_scope=" in build
-        and text.count("steps.cache_keys.outputs.mesh_legacy_scope") == 1,
-        "mesh restores must retain a one-generation fallback to the existing safe cache key",
-    )
+    require("LEGACY_NATIVE_HASH" not in build and "mesh_legacy_scope" not in build, "mesh caches must not use a widened legacy fallback")
 
     build_step = build.index("Build unsigned Tauri app")
     for save_name in ("Save pnpm store cache", "Save Cargo downloads cache", "Save compiler outputs cache"):
@@ -194,22 +192,30 @@ def main() -> None:
     require(build.count("if: success() && steps.") == 4, "cache saves must remain success-only")
 
     require(
-        '--method POST "repos/$GITHUB_REPOSITORY/git/refs"' not in publish,
-        "gh release create already creates the source tag; publication must not create it twice",
+        publish.count('--method POST "repos/$GITHUB_REPOSITORY/git/refs"') == 1,
+        "draft publication must explicitly create exactly one verified source tag",
     )
     require(
         '"repos/$GITHUB_REPOSITORY/releases/tags/$TAG"' not in publish,
         "draft releases cannot be resolved through the public tag endpoint",
     )
+    require(
+        publish.count('"repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"') == 3,
+        "verification, publication, and final URL lookup must use the same numeric release ID",
+    )
+    for rest_field in ("draft", "prerelease", "tag_name", "target_commitish", "assets"):
+        require(f'release["{rest_field}"]' in publish, f"numeric release verification must check REST field {rest_field}")
 
     publish_order = (
         publish.index("Download verified build handoff"),
         publish.index("Verify release assets"),
         publish.index("Create draft and publish prerelease"),
         publish.index("gh release create"),
-        publish.index("RELEASE_JSON="),
-        publish.index("git/ref/tags/$TAG", publish.index("RELEASE_JSON=")),
         publish.index("RELEASES_FILE="),
+        publish.index("RELEASE_ID="),
+        publish.index("RELEASE_JSON="),
+        publish.index("--method POST \"repos/$GITHUB_REPOSITORY/git/refs\""),
+        publish.index("git/ref/tags/$TAG", publish.index("--method POST \"repos/$GITHUB_REPOSITORY/git/refs\"")),
         publish.index("draft=false"),
     )
     require(list(publish_order) == sorted(publish_order), "publication boundary steps are out of order")
