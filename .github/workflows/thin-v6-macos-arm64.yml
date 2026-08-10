@@ -1,27 +1,96 @@
 name: Thin v6 macOS ARM64 candidate
 
 on:
-  push:
-    branches:
-      - feat/thin-v6-runtime-plan
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character commit SHA whose source CI already passed
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: thin-v6-macos-arm64-${{ github.ref }}
+  group: thin-v6-macos-arm64-${{ inputs.source_sha }}
   cancel-in-progress: false
 
 jobs:
+  verify_source:
+    name: Verify immutable source and CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Require a full commit SHA
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "::error::source_sha must be a full 40-character commit SHA"
+            exit 1
+          }
+
+      - name: Check out requested source
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve immutable source SHA
+        id: source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          resolved=$(git rev-parse 'HEAD^{commit}')
+          [[ "${resolved,,}" == "${SOURCE_SHA,,}" ]] || {
+            echo "::error::checkout resolved to $resolved instead of $SOURCE_SHA"
+            exit 1
+          }
+          echo "source_sha=$resolved" >> "$GITHUB_OUTPUT"
+
+      - name: Require successful source CI for exact SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f head_sha="$SOURCE_SHA" \
+            -f status=completed \
+            -f per_page=100 > "$RUNNER_TEMP/ci-runs.json"
+          python3 - "$RUNNER_TEMP/ci-runs.json" <<'PY'
+          import json, os, pathlib, sys
+
+          source_sha = os.environ["SOURCE_SHA"]
+          runs = json.loads(pathlib.Path(sys.argv[1]).read_text())["workflow_runs"]
+          matches = [
+              run for run in runs
+              if run.get("head_sha") == source_sha and run.get("conclusion") == "success"
+          ]
+          if not matches:
+              raise SystemExit(f"source CI has not passed for exact SHA {source_sha}")
+          selected = max(matches, key=lambda run: run["run_number"])
+          print(f"verified CI run {selected['html_url']} for {source_sha}")
+          PY
+
   build:
     name: Build isolated thin v6 Buzz.app
+    needs: verify_source
     if: github.repository == 'Peakhunter/buzz'
     runs-on: macos-26
     timeout-minutes: 90
     env:
       TARGET: aarch64-apple-darwin
       CANDIDATE_ID: thin-v6
+      SOURCE_SHA: ${{ needs.verify_source.outputs.source_sha }}
       MACOSX_DEPLOYMENT_TARGET: "10.15"
       CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
@@ -37,7 +106,7 @@ jobs:
       - name: Check out exact candidate source
         uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.verify_source.outputs.source_sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -65,7 +134,7 @@ jobs:
         id: native-toolchain
         run: echo "id=$(scripts/desktop-native-toolchain-id.sh macos)" >> "$GITHUB_OUTPUT"
 
-      - name: Compute exact release Cargo cache key
+      - name: Compute compatible release Cargo cache base
         id: cargo-key
         env:
           NATIVE_TOOLCHAIN_ID: ${{ steps.native-toolchain.outputs.id }}
@@ -76,19 +145,30 @@ jobs:
             --target "$TARGET" \
             --features default \
             --native-inputs "$NATIVE_TOOLCHAIN_ID")
-          echo "key=thin-v6-$key" >> "$GITHUB_OUTPUT"
+          echo "base=thin-v6-$key" >> "$GITHUB_OUTPUT"
 
-      - name: Restore exact Cargo cache
-        id: cargo-restore
+      - name: Restore Cargo dependency cache
+        id: cargo-deps-restore
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+          key: thin-v6-cargo-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'desktop/src-tauri/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            thin-v6-cargo-deps-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore source-sensitive Cargo target cache
+        id: cargo-target-restore
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
             target
             desktop/src-tauri/target
             !desktop/src-tauri/target/**/release/bundle
-          key: ${{ steps.cargo-key.outputs.key }}
+          key: ${{ steps.cargo-key.outputs.base }}-${{ needs.verify_source.outputs.source_sha }}
+          restore-keys: |
+            ${{ steps.cargo-key.outputs.base }}-
 
       - name: Generate isolated non-updating candidate config
         env:
@@ -186,7 +266,7 @@ jobs:
           set -euo pipefail
           OUT="$RUNNER_TEMP/thin-v6-artifact"
           mkdir -p "$OUT"
-          ZIP="$OUT/Buzz-v6-candidate-arm64-${GITHUB_SHA}.zip"
+          ZIP="$OUT/Buzz-v6-candidate-arm64-${SOURCE_SHA}.zip"
           ditto -c -k --keepParent "$APP_PATH" "$ZIP"
           export OUT ZIP
           python3 - <<'PY'
@@ -220,7 +300,7 @@ jobs:
               "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "source": {
                   "repository": os.environ["GITHUB_REPOSITORY"],
-                  "commit": os.environ["GITHUB_SHA"],
+                  "commit": os.environ["SOURCE_SHA"],
                   "canonical_base": os.environ["CANONICAL_BASE_SHA"],
                   "adr_anchor": os.environ["ADR_ANCHOR_SHA"],
                   "ref": os.environ["GITHUB_REF"],
@@ -279,26 +359,53 @@ jobs:
       - name: Upload one-day verification artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: thin-v6-macos-arm64-${{ github.sha }}
+          name: thin-v6-macos-arm64-${{ needs.verify_source.outputs.source_sha }}
           path: ${{ runner.temp }}/thin-v6-artifact/
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
 
-      - name: Save exact Cargo cache
-        if: always() && steps.cargo-restore.outputs.cache-hit != 'true'
+      - name: Publish cache telemetry
+        if: ${{ !cancelled() }}
+        env:
+          PNPM_HIT: ${{ steps.pnpm-restore.outputs.cache-hit }}
+          PNPM_RESTORED_KEY: ${{ steps.pnpm-restore.outputs.cache-primary-key }}
+          CARGO_DEPS_HIT: ${{ steps.cargo-deps-restore.outputs.cache-hit }}
+          CARGO_DEPS_RESTORED_KEY: ${{ steps.cargo-deps-restore.outputs.cache-primary-key }}
+          CARGO_TARGET_HIT: ${{ steps.cargo-target-restore.outputs.cache-hit }}
+          CARGO_TARGET_RESTORED_KEY: ${{ steps.cargo-target-restore.outputs.cache-primary-key }}
+          CARGO_TARGET_EXACT_KEY: ${{ steps.cargo-key.outputs.base }}-${{ needs.verify_source.outputs.source_sha }}
+        run: |
+          {
+            echo "## Thin v6 candidate cache telemetry"
+            echo "- Source SHA: \`$SOURCE_SHA\`"
+            echo "- pnpm exact hit: \`${PNPM_HIT:-false}\` (restored: \`${PNPM_RESTORED_KEY:-none}\`)"
+            echo "- Cargo dependencies exact hit: \`${CARGO_DEPS_HIT:-false}\` (restored: \`${CARGO_DEPS_RESTORED_KEY:-none}\`)"
+            echo "- Cargo target exact key: \`$CARGO_TARGET_EXACT_KEY\`"
+            echo "- Cargo target exact hit: \`${CARGO_TARGET_HIT:-false}\` (restored: \`${CARGO_TARGET_RESTORED_KEY:-none}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save source-sensitive Cargo target cache
+        if: success() && steps.cargo-target-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            target
+            desktop/src-tauri/target
+            !desktop/src-tauri/target/**/release/bundle
+          key: ${{ steps.cargo-key.outputs.base }}-${{ needs.verify_source.outputs.source_sha }}
+
+      - name: Save Cargo dependency cache
+        if: success() && steps.cargo-deps-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-            desktop/src-tauri/target
-            !desktop/src-tauri/target/**/release/bundle
-          key: ${{ steps.cargo-key.outputs.key }}
+          key: thin-v6-cargo-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'desktop/src-tauri/Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Save pnpm store cache
-        if: always() && steps.pnpm-restore.outputs.cache-hit != 'true'
+        if: success() && steps.pnpm-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm-cache.outputs.store }}
