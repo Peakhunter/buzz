@@ -144,6 +144,8 @@ def main() -> None:
         '"repos/$GITHUB_REPOSITORY/releases?per_page=100"',
         'RELEASES_FILE="$RUNNER_TEMP/releases.json"',
         "draft release lookup did not return exactly one matching release",
+        "draft release did not become visible after bounded retries",
+        "test release tag did not become visible after bounded retries",
         "draft=false",
         "names != expected",
         "Buzz_test_",
@@ -202,6 +204,33 @@ def main() -> None:
     require(
         publish.count('"repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"') == 3,
         "verification, publication, and final URL lookup must use the same numeric release ID",
+    )
+    retry_header = "for attempt in 1 2 3 4 5 6 7 8 9 10; do"
+    release_retry_start = publish.index(retry_header, publish.index('RELEASE_ID=""'))
+    release_retry_end = publish.index("RELEASE_JSON=", release_retry_start)
+    release_retry = publish[release_retry_start:release_retry_end]
+    require(
+        release_retry.count('"repos/$GITHUB_REPOSITORY/releases?per_page=100"') == 1
+        and '"${RELEASE_MATCH[0]}" == "1"' in release_retry
+        and '"${RELEASE_MATCH[0]}" != "0"' in release_retry
+        and '"$attempt" == "10"' in release_retry
+        and "draft release did not become visible after bounded retries" in release_retry
+        and release_retry.count("sleep 1") == 1,
+        "draft visibility GET and zero/one/multiple handling must remain inside one bounded retry loop",
+    )
+
+    tag_post = publish.index('--method POST "repos/$GITHUB_REPOSITORY/git/refs"')
+    tag_retry_start = publish.index(retry_header, tag_post)
+    tag_retry_end = publish.index("mapfile -t TAG_OBJECT", tag_retry_start)
+    tag_retry = publish[tag_retry_start:tag_retry_end]
+    require(
+        tag_post < tag_retry_start
+        and '--method POST "repos/$GITHUB_REPOSITORY/git/refs"' not in tag_retry
+        and tag_retry.count('"repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"') == 1
+        and '"$attempt" == "10"' in tag_retry
+        and "test release tag did not become visible after bounded retries" in tag_retry
+        and tag_retry.count("sleep 1") == 1,
+        "tag POST must remain outside its bounded visibility-GET retry loop",
     )
     for rest_field in ("draft", "prerelease", "tag_name", "target_commitish", "assets"):
         require(f'release["{rest_field}"]' in publish, f"numeric release verification must check REST field {rest_field}")
