@@ -458,14 +458,8 @@ pub fn spawn_agent_child(
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
 
-    // Resolve known runtimes once into content-identified absolute paths.
-    // Every downstream operation in this spawn consumes this plan; no known
-    // runtime may silently rediscover a replacement from PATH afterward.
     let runtime_plan = resolve_runtime_execution_plan(effective_command).map_err(|error| {
-        format!(
-            "cannot resolve runtime plan for agent {}: {error}",
-            record.pubkey
-        )
+        format!("cannot resolve runtime plan for agent {}: {error}", record.pubkey)
     })?;
 
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
@@ -501,8 +495,7 @@ pub fn spawn_agent_child(
             }
         }
     };
-    // Known runtimes execute only the plan's absolute harness path. Custom
-    // harnesses remain on the legacy resolver until they gain a trust flow.
+    // Custom harnesses remain on the legacy resolver until they gain a trust flow.
     let resolved_agent_command = match runtime_plan.as_ref() {
         Some(plan) => plan.harness_path()?.display().to_string(),
         None => resolve_command(effective_command)
