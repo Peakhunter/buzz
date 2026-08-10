@@ -157,8 +157,7 @@ jobs:
           PNPM_HASH: ${{ hashFiles('pnpm-lock.yaml') }}
           CARGO_HASH: ${{ hashFiles('Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
           COMPILER_HASH: ${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
-          NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'bin/.cmake-*.pkg') }}
-          LEGACY_NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'bin/.cmake-*.pkg') }}
+          NATIVE_HASH: ${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'bin/.cmake-*.pkg') }}
         run: |
           set -euo pipefail
           echo "pnpm_key=pnpm-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-${PNPM_HASH}" >> "$GITHUB_OUTPUT"
@@ -166,7 +165,6 @@ jobs:
           echo "compiler_scope=rust-compiler-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-${COMPILER_HASH}" >> "$GITHUB_OUTPUT"
           echo "compiler_key=rust-compiler-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-${COMPILER_HASH}-${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
           echo "mesh_scope=mesh-llama-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-metal-macos10.15-${NATIVE_HASH}" >> "$GITHUB_OUTPUT"
-          echo "mesh_legacy_scope=mesh-llama-${RUNNER_OS}-${RUNNER_ARCHITECTURE}-metal-macos10.15-${LEGACY_NATIVE_HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store cache
         id: pnpm_restore
@@ -267,8 +265,6 @@ jobs:
         with:
           path: ${{ github.workspace }}/.cache/mesh-llama
           key: ${{ steps.cache_keys.outputs.mesh_scope }}-${{ steps.mesh_rev.outputs.rev }}
-          restore-keys: |
-            ${{ steps.cache_keys.outputs.mesh_legacy_scope }}-${{ steps.mesh_rev.outputs.rev }}
 
       - name: Build mesh llama native libraries
         if: steps.mesh_restore.outputs.cache-hit != 'true'
@@ -572,16 +568,40 @@ jobs:
             release-assets/manifest.json \
             release-assets/SHA256SUMS.txt
 
-          RELEASE_JSON=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,targetCommitish,assets)
-          RELEASE_JSON="$RELEASE_JSON" SOURCE_SHA="$SOURCE_SHA" SHORT_SHA="$SHORT_SHA" python3 - <<'PY'
+          RELEASES_FILE="$RUNNER_TEMP/releases.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RELEASES_FILE"
+          RELEASE_ID=$(
+            RELEASES_FILE="$RELEASES_FILE" TAG="$TAG" python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["RELEASES_FILE"], encoding="utf-8") as releases_file:
+              releases = json.load(releases_file)
+          matches = [
+              release
+              for release in releases
+              if release["tag_name"] == os.environ["TAG"]
+              and release["draft"]
+              and release["prerelease"]
+          ]
+          if len(matches) != 1:
+              raise SystemExit("draft release lookup did not return exactly one matching release")
+          print(matches[0]["id"])
+          PY
+          )
+
+          RELEASE_JSON=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          RELEASE_JSON="$RELEASE_JSON" SOURCE_SHA="$SOURCE_SHA" SHORT_SHA="$SHORT_SHA" TAG="$TAG" python3 - <<'PY'
           import json
           import os
 
           release = json.loads(os.environ["RELEASE_JSON"])
           names = {asset["name"] for asset in release["assets"]}
-          if not release["isDraft"] or not release["isPrerelease"]:
+          if not release["draft"] or not release["prerelease"]:
               raise SystemExit("release must remain a draft prerelease until verification completes")
-          if release["targetCommitish"] != os.environ["SOURCE_SHA"]:
+          if release["tag_name"] != os.environ["TAG"]:
+              raise SystemExit("draft release tag name does not match intended tag")
+          if release["target_commitish"] != os.environ["SOURCE_SHA"]:
               raise SystemExit("release target does not match source SHA")
           expected = {
               f"Buzz_test_{os.environ['SHORT_SHA']}_macos-arm64_adhoc.zip",
@@ -591,6 +611,10 @@ jobs:
           if names != expected:
               raise SystemExit(f"unexpected release assets: {sorted(names)}")
           PY
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$TAG" \
+            -f sha="$SOURCE_SHA" >/dev/null
 
           mapfile -t TAG_OBJECT < <(
             gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type, .object.sha'
@@ -620,29 +644,8 @@ jobs:
             exit 1
           fi
 
-          RELEASES_FILE="$RUNNER_TEMP/releases.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RELEASES_FILE"
-          RELEASE_ID=$(
-            RELEASES_FILE="$RELEASES_FILE" TAG="$TAG" python3 - <<'PY'
-          import json
-          import os
-
-          with open(os.environ["RELEASES_FILE"], encoding="utf-8") as releases_file:
-              releases = json.load(releases_file)
-          matches = [
-              release
-              for release in releases
-              if release["tag_name"] == os.environ["TAG"]
-              and release["draft"]
-              and release["prerelease"]
-          ]
-          if len(matches) != 1:
-              raise SystemExit("draft release lookup did not return exactly one matching release")
-          print(matches[0]["id"])
-          PY
-          )
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false >/dev/null
-          URL=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
+          URL=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .html_url)
           {
             echo "## Published Buzz test prerelease"
             echo "- Source: \`$SOURCE_SHA\`"
