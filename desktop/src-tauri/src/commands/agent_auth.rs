@@ -209,6 +209,7 @@ fn run_buzz_acp_auth_command_with_paths<const N: usize>(
     let mut command = Command::new(acp_path);
     command
         .args(args)
+        .env_remove(crate::managed_agents::runtime_plan::AGENT_IDENTITY_ENV)
         .env("BUZZ_ACP_AGENT_COMMAND", adapter_path.as_os_str())
         .env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","))
         .stdout(Stdio::piped())

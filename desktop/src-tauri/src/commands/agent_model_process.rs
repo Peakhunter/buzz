@@ -45,6 +45,7 @@ pub(super) async fn run_agent_models_command(
         }
         cmd.arg("models")
             .arg("--json")
+            .env_remove(crate::managed_agents::runtime_plan::AGENT_IDENTITY_ENV)
             .env("BUZZ_ACP_AGENT_COMMAND", &agent_command)
             .env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
         if let Some(meta) = known_acp_runtime(&agent_command) {

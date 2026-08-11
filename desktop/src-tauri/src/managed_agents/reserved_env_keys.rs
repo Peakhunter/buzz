@@ -39,6 +39,8 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // Code-execution surface: overriding would let the user run arbitrary
     // binaries/args as the agent process.
     "BUZZ_ACP_AGENT_COMMAND",
+    // Logical builtin identity is projected only by an immutable runtime plan.
+    "BUZZ_ACP_AGENT_IDENTITY",
     "BUZZ_ACP_AGENT_ARGS",
     "BUZZ_ACP_MCP_COMMAND",
     // Provider executable selection belongs exclusively to an immutable
