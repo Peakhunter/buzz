@@ -11,6 +11,7 @@ use crate::managed_agents::{
 };
 mod presets;
 mod runtime_metadata;
+mod sidecar_resolution;
 #[macro_use]
 mod windows_install;
 pub(crate) use presets::{
@@ -19,6 +20,10 @@ pub(crate) use presets::{
 };
 use presets::{preset_catalog_entry, PRESET_HARNESSES};
 pub(crate) use runtime_metadata::KnownAcpRuntime;
+use sidecar_resolution::{
+    resolve_packaged_sidecar_command, resolve_workspace_command_resolution,
+    WorkspaceCommandResolution,
+};
 
 const GOOSE_AVATAR_URL: &str = "https://goose-docs.ai/img/logo_dark.png";
 const CLAUDE_CODE_AVATAR_URL: &str = "https://anthropic.gallerycdn.vsassets.io/extensions/anthropic/claude-code/2.1.77/1773707456892/Microsoft.VisualStudio.Services.Icons.Default";
@@ -472,34 +477,6 @@ pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<Strin
     normalized
 }
 
-fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
-    if cfg!(debug_assertions) {
-        // `just dev` builds fresh debug sidecars; never prefer stale release output.
-        [root.join("target/debug"), root.join("target/release")]
-    } else {
-        [root.join("target/release"), root.join("target/debug")]
-    }
-}
-
-fn command_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
-    if let Ok(current_dir) = std::env::current_dir() {
-        dirs.extend(profile_target_dirs(&current_dir));
-    }
-
-    dirs.extend(
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf)),
-    );
-    dirs.into_iter().fold(Vec::new(), |mut unique, dir| {
-        if !unique.contains(&dir) {
-            unique.push(dir);
-        }
-        unique
-    })
-}
-
 fn is_executable_file(path: &Path) -> bool {
     let Ok(metadata) = path.metadata() else {
         return false;
@@ -520,17 +497,13 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+#[cfg(test)]
 fn resolve_workspace_command(command: &str) -> Option<PathBuf> {
-    if command_looks_like_path(command) {
-        let path = PathBuf::from(command);
-        return is_executable_file(&path).then_some(path);
+    match resolve_workspace_command_resolution(command) {
+        WorkspaceCommandResolution::Resolved(path) => Some(path),
+        WorkspaceCommandResolution::PackagedSidecarMissing
+        | WorkspaceCommandResolution::NotFound => None,
     }
-
-    let file_name = executable_basename(command);
-    command_search_dirs()
-        .into_iter()
-        .map(|dir| dir.join(&file_name))
-        .find(|candidate| is_executable_file(candidate))
 }
 
 fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>>
@@ -545,6 +518,21 @@ fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String
 /// The cache eliminates redundant login-shell spawns when multiple agents share
 /// the same binaries (e.g. `npx`, `uvx`).
 pub fn resolve_command(command: &str) -> Option<PathBuf> {
+    // The packaged-sidecar boundary is stronger than every managed/PATH/cache
+    // fallback. Check it first so a future managed-command addition cannot
+    // accidentally override the binary shipped in the running app bundle.
+    if let Some(resolution) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(|current_exe| resolve_packaged_sidecar_command(command, current_exe))
+    {
+        return match resolution {
+            WorkspaceCommandResolution::Resolved(path) => Some(path),
+            WorkspaceCommandResolution::PackagedSidecarMissing
+            | WorkspaceCommandResolution::NotFound => None,
+        };
+    }
+
     if let Some(managed) = resolve_buzz_managed_command(command) {
         return Some(managed);
     }
@@ -671,8 +659,10 @@ fn resolve_buzz_managed_command(command: &str) -> Option<PathBuf> {
 }
 
 fn resolve_command_uncached(command: &str) -> Option<PathBuf> {
-    if let Some(path) = resolve_workspace_command(command) {
-        return Some(path);
+    match resolve_workspace_command_resolution(command) {
+        WorkspaceCommandResolution::Resolved(path) => return Some(path),
+        WorkspaceCommandResolution::PackagedSidecarMissing => return None,
+        WorkspaceCommandResolution::NotFound => {}
     }
 
     let basenames = command_basenames(command);
