@@ -448,8 +448,28 @@ impl AcpClient {
     /// `build_codex_config_env`.  Pass `false` for test spawns and non-Codex agents.
     ///
     /// After spawning, call [`initialize`](Self::initialize) before any other method.
+    #[cfg(test)]
     pub async fn spawn(
         command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+    ) -> Result<Self, AcpError> {
+        Self::spawn_with_identity(
+            command,
+            command,
+            args,
+            extra_env,
+            has_generated_codex_config,
+        )
+        .await
+    }
+
+    /// Spawn an agent executable while deriving runtime-specific defaults from
+    /// a separately supplied logical identity. Callers must authenticate it.
+    pub async fn spawn_with_identity(
+        command: &str,
+        agent_identity: &str,
         args: &[String],
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
@@ -494,7 +514,7 @@ impl AcpClient {
         // Applied first so both persona `extra_env` (below, via `Command::env`
         // key replacement) and inherited parent env (via the parent-presence
         // check) override them.
-        for &(key, value) in crate::config::default_agent_env(command) {
+        for &(key, value) in crate::config::default_agent_env(agent_identity) {
             if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
@@ -2903,8 +2923,9 @@ mod tests {
     /// `hermes-acp`) and return the value of `var` as the child observed it.
     /// `<unset>` means the child did not receive the var.
     #[cfg(unix)]
-    async fn spawn_named_and_read_child_env(
+    async fn spawn_named_with_identity_and_read_child_env(
         file_name: &str,
+        runtime_identity: &str,
         var: &str,
         extra_env: &[(String, String)],
     ) -> String {
@@ -2913,6 +2934,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("buzz-acp-env-probe-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create env probe dir");
         let path = dir.join(file_name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create nested env probe dir");
+        }
         std::fs::write(
             &path,
             format!("#!/bin/sh\nprintf '%s\\n' \"${{{var}:-<unset>}}\"\n"),
@@ -2922,8 +2946,9 @@ mod tests {
         permissions.set_mode(0o700);
         std::fs::set_permissions(&path, permissions).expect("chmod probe");
 
-        let mut client = AcpClient::spawn(
+        let mut client = AcpClient::spawn_with_identity(
             path.to_str().expect("probe path is UTF-8"),
+            runtime_identity,
             &[],
             extra_env,
             false,
@@ -2939,6 +2964,67 @@ mod tests {
         client.shutdown().await;
         std::fs::remove_dir_all(&dir).expect("remove env probe dir");
         observed
+    }
+
+    #[cfg(unix)]
+    async fn spawn_named_and_read_child_env(
+        file_name: &str,
+        var: &str,
+        extra_env: &[(String, String)],
+    ) -> String {
+        spawn_named_with_identity_and_read_child_env(file_name, file_name, var, extra_env).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_uses_production_codex_identity_for_generic_verified_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "buzz-acp-codex-identity-probe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dist = dir.join("codex-acp/dist");
+        std::fs::create_dir_all(&dist).expect("create Codex probe dist directory");
+        let executable = dist.join("index.js");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\ncase \"${CODEX_CONFIG:-}\" in *'\"network_access\":true'*) printf 'true\\n' ;; *) printf 'missing\\n' ;; esac\n",
+        )
+        .expect("write Codex identity probe");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("stat Codex identity probe")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).expect("chmod Codex identity probe");
+
+        let runtime_identity = "codex";
+        let network_env =
+            crate::config::codex_network_env(runtime_identity, "wss://relay.example.com")
+                .into_iter()
+                .collect::<Vec<_>>();
+        let mut client = AcpClient::spawn_with_identity(
+            executable.to_str().expect("probe path is UTF-8"),
+            runtime_identity,
+            &[],
+            &network_env,
+            true,
+        )
+        .await
+        .expect("spawn Codex identity probe");
+        let observed = client
+            .reader
+            .next()
+            .await
+            .expect("Codex identity probe produced output")
+            .expect("Codex identity probe stdout was readable");
+        client.shutdown().await;
+        std::fs::remove_dir_all(&dir).expect("remove Codex identity probe directory");
+
+        assert_eq!(
+            observed, "true",
+            "logical Codex identity must enable network access even when the verified executable basename is index.js"
+        );
     }
 
     /// Buzz-owned Hermes processes get the configured-MCP isolation default,
@@ -2958,6 +3044,17 @@ mod tests {
             spawn_named_and_read_child_env("hermes-acp", VAR, &[]).await,
             "1",
             "Hermes spawns must default {VAR}=1"
+        );
+        assert_eq!(
+            spawn_named_with_identity_and_read_child_env(
+                "hermes-acp/dist/index.js",
+                "hermes-acp",
+                VAR,
+                &[],
+            )
+            .await,
+            "1",
+            "logical Hermes identity must survive executable canonicalization"
         );
         assert_eq!(
             spawn_named_and_read_child_env("hermes-acp", VAR, &[(VAR.into(), "0".into())]).await,

@@ -177,6 +177,7 @@ fn reserved_keys_include_code_execution_surface() {
     // Overriding lets the user run arbitrary code as the agent.
     for key in [
         "BUZZ_ACP_AGENT_COMMAND",
+        "BUZZ_ACP_AGENT_IDENTITY",
         "BUZZ_ACP_AGENT_ARGS",
         "BUZZ_ACP_MCP_COMMAND",
     ] {

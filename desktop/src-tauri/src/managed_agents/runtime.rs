@@ -538,6 +538,7 @@ pub fn spawn_agent_child(
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
     command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
+    command.env_remove(super::runtime_plan::AGENT_IDENTITY_ENV);
     command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
     match &resolved_mcp_command {
         Some(mcp_cmd) => {

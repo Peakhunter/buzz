@@ -191,6 +191,10 @@ pub struct AuthAgentArgs {
     #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND", default_value = "goose")]
     pub agent_command: String,
 
+    /// Trusted logical runtime identity when the executable has a generic name.
+    #[arg(long, env = "BUZZ_ACP_AGENT_IDENTITY", hide = true)]
+    pub agent_identity: Option<String>,
+
     /// Arguments passed to the agent binary.
     #[arg(
         long,
@@ -249,6 +253,10 @@ pub struct CliArgs {
 
     #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND", default_value = "goose")]
     pub agent_command: String,
+
+    /// Trusted logical runtime identity when the executable has a generic name.
+    #[arg(long, env = "BUZZ_ACP_AGENT_IDENTITY", hide = true)]
+    pub agent_identity: Option<String>,
 
     #[arg(
         long,
@@ -498,6 +506,7 @@ pub struct Config {
     pub keys: Keys,
     pub relay_url: String,
     pub agent_command: String,
+    pub agent_identity: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
     pub idle_timeout_secs: u64,
@@ -912,7 +921,14 @@ impl Config {
             ));
         }
 
-        let agent_args = normalize_agent_args(&agent_command, args.agent_args);
+        let agent_identity = args.agent_identity.unwrap_or_else(|| agent_command.clone());
+        if agent_identity.trim().is_empty() {
+            return Err(ConfigError::ConfigFile(
+                "agent_identity must not be empty".into(),
+            ));
+        }
+
+        let agent_args = normalize_agent_args(&agent_identity, args.agent_args);
 
         if let Some(ref channels) = args.channels {
             for ch in channels {
@@ -1051,7 +1067,7 @@ impl Config {
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
         // for non-Codex agents or unparseable relay URLs.
         let has_generated_codex_config =
-            if let Some(network_env) = codex_network_env(&agent_command, &args.relay_url) {
+            if let Some(network_env) = codex_network_env(&agent_identity, &args.relay_url) {
                 persona_env_vars.push(network_env);
                 true
             } else {
@@ -1064,6 +1080,7 @@ impl Config {
             keys,
             relay_url: args.relay_url,
             agent_command,
+            agent_identity,
             agent_args,
             mcp_command: args.mcp_command,
             idle_timeout_secs,
@@ -1443,6 +1460,7 @@ mod tests {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
+            agent_identity: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -2741,6 +2759,37 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn production_codex_identity_controls_config_for_generic_executable() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--relay-url",
+            "wss://relay.example.com",
+            "--agent-command",
+            "/opt/codex-acp/dist/index.js",
+            "--agent-identity",
+            "codex",
+        ])
+        .expect("clap should parse separate command and identity");
+        let config = Config::from_args(args).expect("logical Codex identity should configure");
+
+        assert_eq!(config.agent_identity, "codex");
+        assert!(config.has_generated_codex_config);
+        let network_access = config
+            .persona_env_vars
+            .iter()
+            .find(|(key, _)| key == "CODEX_CONFIG")
+            .and_then(|(_, value)| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| {
+                value
+                    .pointer("/sandbox_workspace_write/network_access")
+                    .and_then(serde_json::Value::as_bool)
+            });
+        assert_eq!(network_access, Some(true));
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

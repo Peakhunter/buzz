@@ -1841,7 +1841,7 @@ async fn tokio_main() -> Result<()> {
             .as_deref()
             .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
         memory_enabled: config.memory_enabled,
-        harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
+        harness_name: crate::config::normalize_agent_command_identity(&config.agent_identity),
         relay_url: config.relay_url.clone(),
     });
 
@@ -2056,13 +2056,16 @@ async fn tokio_main() -> Result<()> {
                 slot.respawn_in_flight = true;
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
+                let identity = config.agent_identity.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result =
+                        spawn_and_init(&cmd, &identity, &args, &env, has_codex, idx, observer)
+                            .await;
                     guard.send(result);
                 });
             }
@@ -3870,6 +3873,7 @@ fn recover_panicked_agent(
     // Spawn respawn work off the main loop.
     slot.respawn_in_flight = true;
     let cmd = config.agent_command.clone();
+    let identity = config.agent_identity.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
@@ -3878,7 +3882,7 @@ fn recover_panicked_agent(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&cmd, &identity, &args, &env, has_codex, i, observer).await;
         guard.send(result);
     });
 }
@@ -4065,6 +4069,7 @@ fn spawn_respawn_task(
 
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
+    let identity = config.agent_identity.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
@@ -4079,7 +4084,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(&cmd, &identity, &args, &env, has_codex, index, observer).await;
         guard.send(result);
     });
 
@@ -4120,6 +4125,7 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
 struct PoolStartup {
     agents: u32,
     command: String,
+    identity: String,
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
@@ -4132,6 +4138,7 @@ impl PoolStartup {
         Self {
             agents: config.agents,
             command: config.agent_command.clone(),
+            identity: config.agent_identity.clone(),
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
@@ -4149,8 +4156,9 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let spawn_result = AcpClient::spawn(
+        let spawn_result = AcpClient::spawn_with_identity(
             &startup.command,
+            &startup.identity,
             &startup.args,
             &startup.extra_env,
             startup.has_generated_codex_config,
@@ -4251,15 +4259,22 @@ async fn initialize_agent_pool(
 /// borrowing `Config`. All respawn/refill paths use this.
 async fn spawn_and_init(
     command: &str,
+    identity: &str,
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+    let mut acp = AcpClient::spawn_with_identity(
+        command,
+        identity,
+        args,
+        extra_env,
+        has_generated_codex_config,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
@@ -4287,8 +4302,12 @@ async fn spawn_and_init(
 }
 
 async fn spawn_auth_client(agent: &AuthAgentArgs) -> Result<AcpClient, acp::AcpError> {
-    let agent_args = config::normalize_agent_args(&agent.agent_command, agent.agent_args.clone());
-    AcpClient::spawn(&agent.agent_command, &agent_args, &[], false).await
+    let identity = agent
+        .agent_identity
+        .as_deref()
+        .unwrap_or(&agent.agent_command);
+    let agent_args = config::normalize_agent_args(identity, agent.agent_args.clone());
+    AcpClient::spawn_with_identity(&agent.agent_command, identity, &agent_args, &[], false).await
 }
 
 fn extract_auth_methods(init_result: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -4409,7 +4428,12 @@ async fn run_authenticate(args: AuthenticateArgs) -> Result<()> {
 async fn run_models(args: ModelsArgs) -> Result<()> {
     use acp::{extract_model_config_options, extract_model_state};
 
-    let agent_args = config::normalize_agent_args(&args.agent.agent_command, args.agent.agent_args);
+    let identity = args
+        .agent
+        .agent_identity
+        .as_deref()
+        .unwrap_or(&args.agent.agent_command);
+    let agent_args = config::normalize_agent_args(identity, args.agent.agent_args);
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("/"))
         .to_string_lossy()
@@ -4417,14 +4441,21 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 
     // Spawn outside the timeout so we always own the child for cleanup.
     // `models` subcommand doesn't use persona packs — no extra env, no codex config.
-    let mut client =
-        match AcpClient::spawn(&args.agent.agent_command, &agent_args, &[], false).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: failed to spawn agent: {e}");
-                std::process::exit(1);
-            }
-        };
+    let mut client = match AcpClient::spawn_with_identity(
+        &args.agent.agent_command,
+        identity,
+        &agent_args,
+        &[],
+        false,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to spawn agent: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Initialize + session/new under a timeout. Client is owned above,
     // so shutdown() runs on all paths (success, error, timeout).
@@ -6214,6 +6245,7 @@ mod build_mcp_servers_tests {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
+            agent_identity: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
@@ -6436,6 +6468,7 @@ mod error_outcome_emission_tests {
             // harmlessly off the JoinSet — irrelevant to the synchronous
             // feed emission under test.
             agent_command: "true".into(),
+            agent_identity: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,

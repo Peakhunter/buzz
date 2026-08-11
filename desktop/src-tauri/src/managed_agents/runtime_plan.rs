@@ -18,6 +18,9 @@ use std::{
 
 use super::{known_acp_runtime, resolve_command};
 
+/// Logical runtime identity trusted only when projected by a verified plan.
+pub(crate) const AGENT_IDENTITY_ENV: &str = "BUZZ_ACP_AGENT_IDENTITY";
+
 /// Environment variables that may redirect a known provider executable.
 pub(crate) const DENIED_EXECUTABLE_ENV: &[&str] = &[
     "CLAUDE_CODE_EXECUTABLE",
@@ -173,6 +176,7 @@ impl RuntimeExecutionPlan {
         for (key, value) in &self.generated_env {
             command.env(key, value);
         }
+        command.env(AGENT_IDENTITY_ENV, &self.provider_family);
     }
 }
 
@@ -644,7 +648,8 @@ fn plan_identity(
 mod tests {
     use super::{
         collect_package_files, component_identity, package_inventory, plan_identity,
-        RuntimeComponentRole, RuntimeExecutionPlan, RuntimePlanSource, DENIED_EXECUTABLE_ENV,
+        resolve_runtime_execution_plan, RuntimeComponentRole, RuntimeExecutionPlan,
+        RuntimePlanSource, AGENT_IDENTITY_ENV, DENIED_EXECUTABLE_ENV,
     };
     use std::{collections::BTreeMap, fs};
 
@@ -712,6 +717,52 @@ mod tests {
         plan.verify().expect("approved bytes verify");
         fs::write(&path, b"drifted").expect("replace component");
         assert!(plan.verify().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_codex_plan_projects_catalog_identity_with_canonical_executable() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let package = dir.path().join("codex-acp");
+        let dist = package.join("dist");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&dist).expect("create package dist directory");
+        fs::create_dir_all(&bin).expect("create launcher directory");
+        fs::write(package.join("package.json"), b"{}").expect("write package manifest");
+        let executable = dist.join("index.js");
+        fs::write(&executable, b"#!/usr/bin/env node\n").expect("write generic executable");
+        let mut permissions = fs::metadata(&executable)
+            .expect("stat generic executable")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).expect("chmod generic executable");
+        let launcher = bin.join("codex-acp");
+        symlink(&executable, &launcher).expect("link logical Codex launcher");
+
+        let plan = resolve_runtime_execution_plan(launcher.to_str().expect("UTF-8 launcher"))
+            .expect("resolve Codex runtime plan")
+            .expect("Codex has a verified runtime plan");
+        let canonical_executable = executable.canonicalize().expect("canonical executable");
+        assert_eq!(plan.provider_family, "codex");
+        assert_eq!(
+            plan.harness_path().expect("planned harness"),
+            canonical_executable
+        );
+
+        let mut command = std::process::Command::new("buzz-acp");
+        command
+            .env("BUZZ_ACP_AGENT_COMMAND", &canonical_executable)
+            .env(AGENT_IDENTITY_ENV, "forged-runtime");
+        plan.apply_environment(&mut command);
+
+        assert!(command.get_envs().any(|(key, value)| {
+            key == AGENT_IDENTITY_ENV && value == Some(std::ffi::OsStr::new("codex"))
+        }));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "BUZZ_ACP_AGENT_COMMAND" && value == Some(canonical_executable.as_os_str())
+        }));
     }
 
     #[test]
