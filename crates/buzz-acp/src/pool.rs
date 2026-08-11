@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use crate::acp::{
     extract_model_config_options, extract_model_state, model_in_catalog,
-    resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer, ModelSwitchMethod,
-    StopReason, SystemPromptTransport,
+    resolve_model_switch_method, AcpClient, AcpError, EnvVar, FinalAnswer, McpServer,
+    ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -279,6 +279,9 @@ pub struct PromptResult {
     /// Identifies the completed turn for observer terminal events.
     pub turn_id: String,
     pub outcome: PromptOutcome,
+    /// Adapter-typed terminal answer. Present only for an unambiguous
+    /// `final_answer` group followed by `end_turn`.
+    pub final_answer: Option<FinalAnswer>,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
 }
@@ -1429,11 +1432,19 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    let final_answer = agent.acp.take_completed_prompt_result().and_then(|result| {
+        if matches!(outcome, PromptOutcome::Ok(StopReason::EndTurn)) {
+            result.final_answer
+        } else {
+            None
+        }
+    });
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         turn_id: turn_id.to_owned(),
         outcome,
+        final_answer,
         batch,
     });
 }
@@ -2285,7 +2296,7 @@ pub async fn run_prompt_task(
                             agent,
                             source,
                             PromptOutcome::Ok(StopReason::EndTurn),
-                            None, // turn succeeded — batch was processed, no requeue
+                            None,
                         );
                         return;
                     }

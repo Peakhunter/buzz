@@ -20,6 +20,12 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Maximum final-answer material observed during one prompt. This is deliberately
+/// below the transport line limit and applies across all chunks, IDs, and tool boundaries.
+const MAX_FINAL_ANSWER_BYTES: usize = 1_000_000;
+/// Bound per-prompt bookkeeping even when an agent streams tiny chunks.
+const MAX_FINAL_ANSWER_CHUNKS: usize = 4_096;
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -42,7 +48,7 @@ pub struct EnvVar {
 /// Stop reason returned by `session/prompt` when the agent finishes a turn.
 ///
 /// Maps to the `stopReason` field in the `SessionPromptResponse`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
     /// Agent completed the turn normally (`"end_turn"`).
     EndTurn,
@@ -71,6 +77,181 @@ impl StopReason {
             "refusal" => Some(Self::Refusal),
             _ => None,
         }
+    }
+}
+
+/// A terminal assistant message that is safe to hand to host-managed delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalAnswer {
+    /// Exact ACP message identifier shared by all accumulated chunks.
+    pub message_id: String,
+    /// Reconstructed final-answer text in wire order.
+    pub text: String,
+}
+
+/// Typed result of one terminal `session/prompt` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptTurnResult {
+    /// Terminal reason reported by the ACP prompt response.
+    pub stop_reason: StopReason,
+    /// Fail-closed typed answer, present only for an exact canonical end turn.
+    pub final_answer: Option<FinalAnswer>,
+}
+
+/// Per-turn collector for adapter-typed final answer chunks.
+#[derive(Debug, Default)]
+struct FinalAnswerCollector {
+    groups: Vec<FinalAnswer>,
+    observed_bytes: usize,
+    observed_chunks: usize,
+    candidate_invalid: bool,
+    limit_exceeded: bool,
+    wire_invalid: bool,
+}
+
+impl FinalAnswerCollector {
+    fn observe(&mut self, update: &serde_json::Value) {
+        let update_type = update.get("sessionUpdate").and_then(|value| value.as_str());
+        let is_final_answer = update
+            .pointer("/_meta/codex/phase")
+            .and_then(|value| value.as_str())
+            == Some("final_answer");
+
+        if is_final_answer {
+            if self.limit_exceeded || self.wire_invalid {
+                return;
+            }
+            if !self.account_relevant_chunk(update) {
+                self.exceed_limit();
+                return;
+            }
+            if update_type != Some("agent_message_chunk") {
+                self.invalidate_candidate();
+                return;
+            }
+            if self.candidate_invalid {
+                return;
+            }
+
+            let Some(message_id) = update
+                .get("messageId")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            else {
+                self.invalidate_candidate();
+                return;
+            };
+            if update
+                .pointer("/content/type")
+                .and_then(|value| value.as_str())
+                != Some("text")
+            {
+                self.invalidate_candidate();
+                return;
+            }
+            let Some(text) = update
+                .pointer("/content/text")
+                .and_then(|value| value.as_str())
+            else {
+                self.invalidate_candidate();
+                return;
+            };
+
+            match self
+                .groups
+                .iter_mut()
+                .find(|group| group.message_id == message_id)
+            {
+                Some(group) => group.text.push_str(text),
+                None => self.groups.push(FinalAnswer {
+                    message_id: message_id.to_owned(),
+                    text: text.to_owned(),
+                }),
+            }
+            return;
+        }
+
+        if update_type == Some("tool_call") {
+            if update
+                .get("toolCallId")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                self.groups.clear();
+                self.candidate_invalid = false;
+            } else {
+                self.invalidate_candidate();
+            }
+        }
+    }
+
+    fn account_relevant_chunk(&mut self, update: &serde_json::Value) -> bool {
+        let Some(observed_chunks) = self.observed_chunks.checked_add(1) else {
+            return false;
+        };
+        let material_bytes = update
+            .get("messageId")
+            .into_iter()
+            .chain(update.get("content"))
+            .try_fold(0usize, |total, value| {
+                total.checked_add(serde_json::to_vec(value).ok()?.len())
+            });
+        let Some(observed_bytes) =
+            material_bytes.and_then(|bytes| self.observed_bytes.checked_add(bytes))
+        else {
+            return false;
+        };
+        if observed_bytes > MAX_FINAL_ANSWER_BYTES || observed_chunks > MAX_FINAL_ANSWER_CHUNKS {
+            return false;
+        }
+        self.observed_bytes = observed_bytes;
+        self.observed_chunks = observed_chunks;
+        true
+    }
+
+    fn invalidate_candidate(&mut self) {
+        self.groups.clear();
+        self.candidate_invalid = true;
+    }
+
+    fn exceed_limit(&mut self) {
+        self.invalidate_candidate();
+        self.limit_exceeded = true;
+    }
+
+    fn observe_unparseable_line(&mut self, bytes: usize) {
+        let counts = self
+            .observed_chunks
+            .checked_add(1)
+            .zip(self.observed_bytes.checked_add(bytes));
+        match counts {
+            Some((chunks, total_bytes))
+                if chunks <= MAX_FINAL_ANSWER_CHUNKS && total_bytes <= MAX_FINAL_ANSWER_BYTES =>
+            {
+                self.observed_chunks = chunks;
+                self.observed_bytes = total_bytes;
+            }
+            _ => self.limit_exceeded = true,
+        }
+        self.invalidate_candidate();
+        self.wire_invalid = true;
+    }
+
+    fn finish(&mut self, exact_end_turn: bool) -> Option<FinalAnswer> {
+        let answer = if !self.candidate_invalid
+            && !self.limit_exceeded
+            && !self.wire_invalid
+            && exact_end_turn
+            && self.groups.len() == 1
+        {
+            self.groups
+                .pop()
+                .filter(|answer| !answer.text.trim().is_empty())
+        } else {
+            None
+        };
+        *self = Self::default();
+        answer
     }
 }
 
@@ -211,6 +392,14 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Reset before each prompt; populated only by typed final-answer updates.
+    final_answer_collector: FinalAnswerCollector,
+    /// Session whose updates may contribute to the current typed result.
+    active_prompt_session_id: Option<String>,
+    /// Completed typed result retained until the pool consumes it. This closes
+    /// the prompt/control race where `select!` can drop an already-completed
+    /// prompt future after `last_prompt_id` was cleared.
+    last_completed_prompt_result: Option<PromptTurnResult>,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -570,6 +759,9 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            final_answer_collector: FinalAnswerCollector::default(),
+            active_prompt_session_id: None,
+            last_completed_prompt_result: None,
         })
     }
 
@@ -766,7 +958,25 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        self.session_prompt_blocks_with_idle_timeout(
+        self.session_prompt_turn_with_idle_timeout(
+            session_id,
+            prompt_text,
+            idle_timeout,
+            max_duration,
+        )
+        .await
+        .map(|result| result.stop_reason)
+    }
+
+    /// Send one prompt and preserve an adapter-typed terminal final answer.
+    pub async fn session_prompt_turn_with_idle_timeout(
+        &mut self,
+        session_id: &str,
+        prompt_text: &str,
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<PromptTurnResult, AcpError> {
+        self.session_prompt_turn_blocks_with_idle_timeout(
             session_id,
             std::slice::from_ref(&prompt_text),
             idle_timeout,
@@ -788,6 +998,28 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        self.session_prompt_turn_blocks_with_idle_timeout(
+            session_id,
+            prompt_blocks,
+            idle_timeout,
+            max_duration,
+        )
+        .await
+        .map(|result| result.stop_reason)
+    }
+
+    /// Multi-block prompt variant that preserves the typed terminal answer.
+    pub async fn session_prompt_turn_blocks_with_idle_timeout(
+        &mut self,
+        session_id: &str,
+        prompt_blocks: &[&str],
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<PromptTurnResult, AcpError> {
+        self.active_prompt_session_id = None;
+        self.final_answer_collector = FinalAnswerCollector::default();
+        self.last_completed_prompt_result = None;
+        self.active_prompt_session_id = Some(session_id.to_owned());
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -812,6 +1044,8 @@ impl AcpClient {
         if let Err(e) = self.write_ndjson(&msg).await {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
+            self.active_prompt_session_id = None;
+            self.final_answer_collector = FinalAnswerCollector::default();
             return Err(e);
         }
 
@@ -841,7 +1075,38 @@ impl AcpClient {
                 self.current_hard_deadline = None;
             }
         }
-        self.parse_stop_reason(&result?)
+        self.active_prompt_session_id = None;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.final_answer_collector = FinalAnswerCollector::default();
+                return Err(error);
+            }
+        };
+        // Codex ACP 1.1.14 calls waitForSessionNotifications(sessionId) before
+        // returning session/prompt, so this response is the verified adapter's
+        // terminal turn boundary. ACP updates expose no separate turn ID.
+        let exact_end_turn =
+            result.get("stopReason").and_then(|value| value.as_str()) == Some("end_turn");
+        let stop_reason = match self.parse_stop_reason(&result) {
+            Ok(stop_reason) => stop_reason,
+            Err(error) => {
+                self.final_answer_collector = FinalAnswerCollector::default();
+                return Err(error);
+            }
+        };
+        let final_answer = self.final_answer_collector.finish(exact_end_turn);
+        let turn_result = PromptTurnResult {
+            stop_reason,
+            final_answer,
+        };
+        self.last_completed_prompt_result = Some(turn_result.clone());
+        Ok(turn_result)
+    }
+
+    /// Consume the most recently completed typed prompt result, if any.
+    pub fn take_completed_prompt_result(&mut self) -> Option<PromptTurnResult> {
+        self.last_completed_prompt_result.take()
     }
 
     /// Send a `session/cancel` **notification** (no `id` field, no response expected).
@@ -1032,6 +1297,8 @@ impl AcpClient {
         let prompt_id = self.last_prompt_id.take().ok_or_else(|| {
             AcpError::Protocol("cancel_with_cleanup called with no in-flight prompt".into())
         })?;
+        self.active_prompt_session_id = None;
+        self.final_answer_collector = FinalAnswerCollector::default();
 
         // Step 1: respond to any pending permission request with "cancelled",
         // but only if we haven't already responded (guards against double-response race).
@@ -1553,6 +1820,10 @@ impl AcpClient {
                     let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                         Ok(v) => v,
                         Err(e) => {
+                            if self.active_prompt_session_id.is_some() {
+                                self.final_answer_collector
+                                    .observe_unparseable_line(trimmed.len());
+                            }
                             self.observe(
                                 "acp_parse_error",
                                 serde_json::json!({
@@ -1757,6 +2028,14 @@ impl AcpClient {
     /// needs no run id.
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
         let update = &msg["params"]["update"];
+        let update_session_id = msg["params"]["sessionId"].as_str();
+        if self
+            .active_prompt_session_id
+            .as_deref()
+            .is_some_and(|expected| update_session_id == Some(expected))
+        {
+            self.final_answer_collector.observe(update);
+        }
         let update_type = update
             .get("sessionUpdate")
             .and_then(|v| v.as_str())
@@ -4721,5 +5000,390 @@ mod tests {
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
         );
+    }
+
+    #[test]
+    fn typed_final_answer_is_deliverable_only_after_end_turn() {
+        let mut collector = FinalAnswerCollector::default();
+        collector.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-1",
+            "content": {"type": "text", "text": "hello"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+
+        assert_eq!(collector.finish(false), None);
+        assert!(collector.groups.is_empty());
+
+        collector.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-1",
+            "content": {"type": "text", "text": "hello"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        assert_eq!(
+            collector.finish(true),
+            Some(FinalAnswer {
+                message_id: "message-1".into(),
+                text: "hello".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn final_answer_before_last_tool_boundary_is_not_deliverable() {
+        let mut collector = FinalAnswerCollector::default();
+        collector.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-1",
+            "content": {"type": "text", "text": "premature"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        collector.observe(&serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-1"
+        }));
+
+        assert_eq!(collector.finish(true), None);
+    }
+
+    #[test]
+    fn ambiguous_or_nonterminal_wire_shapes_fail_closed() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "   ",
+                    "content": {"type": "text", "text": "blank id"},
+                    "_meta": {"codex": {"phase": "final_answer"}}
+                }),
+                StopReason::EndTurn,
+            ),
+            (
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "message-1",
+                    "content": {"type": "text", "text": "commentary"},
+                    "_meta": {"codex": {"phase": "commentary"}}
+                }),
+                StopReason::EndTurn,
+            ),
+            (
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "message-1",
+                    "content": {"type": "text", "text": "cancelled"},
+                    "_meta": {"codex": {"phase": "final_answer"}}
+                }),
+                StopReason::Cancelled,
+            ),
+            (
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "message-1",
+                    "content": {"type": "text", "text": "refusal"},
+                    "_meta": {"codex": {"phase": "final_answer"}}
+                }),
+                StopReason::Refusal,
+            ),
+            (
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "message-1",
+                    "content": {"type": "text", "text": "   \n"},
+                    "_meta": {"codex": {"phase": "final_answer"}}
+                }),
+                StopReason::EndTurn,
+            ),
+        ];
+
+        for (update, stop_reason) in cases {
+            let mut collector = FinalAnswerCollector::default();
+            collector.observe(&update);
+            assert_eq!(collector.finish(stop_reason == StopReason::EndTurn), None);
+        }
+
+        let mut multiple = FinalAnswerCollector::default();
+        for message_id in ["message-1", "message-2"] {
+            multiple.observe(&serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": message_id,
+                "content": {"type": "text", "text": "ambiguous"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }));
+        }
+        assert_eq!(multiple.finish(true), None);
+    }
+
+    #[test]
+    fn malformed_final_chunk_poisons_existing_candidate_until_tool_boundary() {
+        let malformed_updates = [
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "missing id"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "message-1",
+                "content": {"type": "image", "text": "not text content"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "message-1",
+                "content": {"type": "text"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }),
+        ];
+
+        for malformed in malformed_updates {
+            let mut collector = FinalAnswerCollector::default();
+            collector.observe(&serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "message-1",
+                "content": {"type": "text", "text": "partial"},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }));
+            collector.observe(&malformed);
+            assert_eq!(collector.finish(true), None);
+        }
+
+        let mut collector = FinalAnswerCollector::default();
+        collector.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "missing id"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        assert!(collector.candidate_invalid);
+
+        collector.observe(&serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-1"
+        }));
+        collector.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-2",
+            "content": {"type": "text", "text": "complete"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        assert_eq!(
+            collector.finish(true),
+            Some(FinalAnswer {
+                message_id: "message-2".into(),
+                text: "complete".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn final_answer_aggregate_limits_fail_closed_across_tool_boundaries() {
+        let mut bytes = FinalAnswerCollector::default();
+        let half = "x".repeat(MAX_FINAL_ANSWER_BYTES / 2);
+        for (message_id, text) in [("message-1", half.as_str()), ("message-2", half.as_str())] {
+            bytes.observe(&serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": message_id,
+                "content": {"type": "text", "text": text},
+                "_meta": {"codex": {"phase": "final_answer"}}
+            }));
+            if message_id == "message-1" {
+                bytes.observe(&serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-1"
+                }));
+            }
+        }
+        assert!(bytes.limit_exceeded);
+        assert_eq!(bytes.finish(true), None);
+
+        let mut chunks = FinalAnswerCollector::default();
+        let update = serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "m",
+            "content": {"type": "text", "text": ""},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        });
+        for index in 0..=MAX_FINAL_ANSWER_CHUNKS {
+            chunks.observe(&update);
+            if index == MAX_FINAL_ANSWER_CHUNKS / 2 {
+                chunks.observe(&serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-1"
+                }));
+            }
+        }
+        assert!(chunks.limit_exceeded);
+        assert_eq!(chunks.finish(true), None);
+    }
+
+    #[test]
+    fn malformed_final_chunks_consume_nonresettable_aggregate_budgets() {
+        let malformed = serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "malformed",
+            "content": {"type": "image", "text": "not text content"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        });
+        let valid_tool = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-1"
+        });
+        let valid_answer = serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "valid",
+            "content": {"type": "text", "text": "answer"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        });
+
+        let mut chunks = FinalAnswerCollector::default();
+        for _ in 0..=MAX_FINAL_ANSWER_CHUNKS {
+            chunks.observe(&malformed);
+        }
+        chunks.observe(&valid_tool);
+        chunks.observe(&valid_answer);
+        assert!(chunks.limit_exceeded);
+        assert_eq!(chunks.finish(true), None);
+
+        let mut bytes = FinalAnswerCollector::default();
+        bytes.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "malformed",
+            "content": {
+                "type": "image",
+                "text": "x".repeat(MAX_FINAL_ANSWER_BYTES)
+            },
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        bytes.observe(&valid_tool);
+        bytes.observe(&valid_answer);
+        assert!(bytes.limit_exceeded);
+        assert_eq!(bytes.finish(true), None);
+    }
+
+    #[test]
+    fn malformed_outer_final_chunks_poison_and_consume_aggregate_budgets() {
+        let valid_answer = serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "valid",
+            "content": {"type": "text", "text": "answer"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        });
+        let malformed_outer = serde_json::json!({
+            "messageId": "malformed",
+            "content": {"type": "text", "text": "hidden"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        });
+
+        let mut poisoned = FinalAnswerCollector::default();
+        poisoned.observe(&valid_answer);
+        poisoned.observe(&malformed_outer);
+        assert_eq!(poisoned.finish(true), None);
+
+        let mut limited = FinalAnswerCollector::default();
+        for _ in 0..=MAX_FINAL_ANSWER_CHUNKS {
+            limited.observe(&malformed_outer);
+        }
+        limited.observe(&serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-1"
+        }));
+        limited.observe(&valid_answer);
+        assert!(limited.limit_exceeded);
+        assert_eq!(limited.finish(true), None);
+    }
+
+    #[test]
+    fn malformed_tool_boundary_cannot_reenable_collection() {
+        let mut collector = FinalAnswerCollector::default();
+        collector.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-1",
+            "content": {"type": "text", "text": "before"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        collector.observe(&serde_json::json!({"sessionUpdate": "tool_call"}));
+        collector.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-2",
+            "content": {"type": "text", "text": "after malformed boundary"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        assert_eq!(collector.finish(true), None);
+    }
+
+    #[tokio::test]
+    async fn noncanonical_end_turn_does_not_classify_final_answer() {
+        for raw_stop_reason in ["END_TURN", "End_Turn"] {
+            let script = format!(
+                "read _; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"session-1\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"message-1\",\"content\":{{\"type\":\"text\",\"text\":\"hello\"}},\"_meta\":{{\"codex\":{{\"phase\":\"final_answer\"}}}}}}}}}}' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"stopReason\":\"{raw_stop_reason}\"}}}}'; sleep 1"
+            );
+            let mut client = spawn_script(&script).await;
+            let result = client
+                .session_prompt_turn_with_idle_timeout(
+                    "session-1",
+                    "prompt",
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .expect("case-insensitive legacy stop parsing remains supported");
+            assert_eq!(result.stop_reason, StopReason::EndTurn);
+            assert_eq!(result.final_answer, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_prompt_returns_typed_final_answer_from_wire() {
+        let mut client = spawn_script(
+            r#"read _; printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-other","update":{"sessionUpdate":"agent_message_chunk","messageId":"wrong-session","content":{"type":"text","text":"wrong"},"_meta":{"codex":{"phase":"final_answer"}}}}}' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"missing-session","content":{"type":"text","text":"wrong"},"_meta":{"codex":{"phase":"final_answer"}}}}}' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","messageId":"message-1","content":{"type":"text","text":"hello"},"_meta":{"codex":{"phase":"final_answer"}}}}}' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'; sleep 1"#,
+        )
+        .await;
+
+        let result = client
+            .session_prompt_turn_with_idle_timeout(
+                "session-1",
+                "prompt",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("prompt result");
+
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            client.take_completed_prompt_result(),
+            Some(result.clone()),
+            "pool/control races must still be able to consume the completed turn"
+        );
+        assert_eq!(client.take_completed_prompt_result(), None);
+        assert_eq!(
+            result.final_answer,
+            Some(FinalAnswer {
+                message_id: "message-1".into(),
+                text: "hello".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_ndjson_during_prompt_poisons_typed_final_answer() {
+        let mut client = spawn_script(
+            r#"read _; printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","messageId":"message-1","content":{"type":"text","text":"partial"},"_meta":{"codex":{"phase":"final_answer"}}}}}' '{"jsonrpc":"2.0","method":"session/update"' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'; sleep 1"#,
+        )
+        .await;
+
+        let result = client
+            .session_prompt_turn_with_idle_timeout(
+                "session-1",
+                "prompt",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("prompt result");
+
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(result.final_answer, None);
     }
 }

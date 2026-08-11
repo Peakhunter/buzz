@@ -3423,6 +3423,14 @@ fn handle_prompt_result(
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
+    if let Some(final_answer) = result.final_answer.as_ref() {
+        tracing::debug!(
+            target: "pool::final-answer",
+            message_id = %final_answer.message_id,
+            bytes = final_answer.text.len(),
+            "captured fail-closed terminal ACP answer; delivery is intentionally out of scope",
+        );
+    }
     if let PromptSource::Channel(channel_id) = &result.source {
         // The task may have invalidated this session before returning. Never
         // resurrect delivery state for a dead session; its replacement must
@@ -6597,6 +6605,7 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            final_answer: None,
             batch: None,
         };
 
@@ -6669,6 +6678,7 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            final_answer: None,
             batch: None,
         };
 
@@ -6783,6 +6793,7 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            final_answer: None,
             batch: None,
         };
 
@@ -6846,6 +6857,7 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(Uuid::new_v4()),
             turn_id: "test-turn-id".to_string(),
             outcome,
+            final_answer: None,
             batch: None,
         };
 
@@ -7014,6 +7026,7 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(Uuid::new_v4()),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
+                final_answer: None,
                 batch: None,
             };
             handle_prompt_result(
@@ -7105,6 +7118,7 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
+                final_answer: None,
                 batch: Some(batch),
             };
             handle_prompt_result(
@@ -7211,6 +7225,7 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
+                final_answer: None,
                 batch: Some(batch),
             };
             handle_prompt_result(
@@ -7303,6 +7318,7 @@ mod error_outcome_emission_tests {
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
+            final_answer: None,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -7397,6 +7413,7 @@ mod error_outcome_emission_tests {
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
+            final_answer: None,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -7512,6 +7529,7 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
+            final_answer: None,
             batch: Some(batch),
         };
 
@@ -7645,6 +7663,7 @@ mod error_outcome_emission_tests {
             // Explicit Stop already dropped the batch upstream in
             // `classify_control_cancel_failure` — `handle_prompt_result`
             // never sees one to requeue.
+            final_answer: None,
             batch: None,
         };
 
@@ -7829,6 +7848,7 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
+            final_answer: None,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -7915,6 +7935,7 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
+            final_answer: None,
             batch: Some(batch),
         };
         handle_prompt_result(
