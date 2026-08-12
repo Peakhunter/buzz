@@ -20,6 +20,77 @@ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use crate::observer::{ObserverContext, ObserverHandle};
 use crate::usage::{TurnUsage, UsageTracker};
 
+#[derive(Debug, Default)]
+struct TurnTimingState {
+    prompt_sent_at: Option<std::time::Instant>,
+    terminal_response_at: Option<std::time::Instant>,
+    legacy_publication_observed_at: Option<std::time::Instant>,
+    session_was_new: Option<bool>,
+}
+
+/// Process-local monotonic timing state shared across one Gate A1 turn.
+#[derive(Debug)]
+pub(crate) struct TurnTimingMetadata {
+    inbound_admitted_at: std::time::Instant,
+    state: std::sync::Mutex<TurnTimingState>,
+}
+
+impl TurnTimingMetadata {
+    pub(crate) fn new(inbound_admitted_at: std::time::Instant) -> Self {
+        Self {
+            inbound_admitted_at,
+            state: std::sync::Mutex::new(TurnTimingState::default()),
+        }
+    }
+
+    pub(crate) fn set_session_was_new(&self, session_was_new: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.session_was_new = Some(session_was_new);
+        }
+    }
+
+    pub(crate) fn record_prompt_sent_at(&self, at: std::time::Instant) {
+        if let Ok(mut state) = self.state.lock() {
+            state.prompt_sent_at.get_or_insert(at);
+        }
+    }
+
+    pub(crate) fn record_terminal_response_at(&self, at: std::time::Instant) {
+        if let Ok(mut state) = self.state.lock() {
+            state.terminal_response_at.get_or_insert(at);
+        }
+    }
+
+    pub(crate) fn record_legacy_publication_observed_at(&self, at: std::time::Instant) {
+        if let Ok(mut state) = self.state.lock() {
+            state.legacy_publication_observed_at.get_or_insert(at);
+        }
+    }
+
+    pub(crate) fn telemetry(&self) -> serde_json::Value {
+        let Ok(state) = self.state.lock() else {
+            return serde_json::json!({});
+        };
+        let elapsed_ms = |start: std::time::Instant, end: std::time::Instant| {
+            i64::try_from(end.saturating_duration_since(start).as_millis()).unwrap_or(i64::MAX)
+        };
+        let signed_elapsed_ms = |start: std::time::Instant, end: std::time::Instant| {
+            if end >= start {
+                elapsed_ms(start, end)
+            } else {
+                -elapsed_ms(end, start)
+            }
+        };
+        serde_json::json!({
+            "inboundAdmittedToPromptSentMs": state.prompt_sent_at.map(|at| elapsed_ms(self.inbound_admitted_at, at)),
+            "promptSentToTerminalResponseMs": state.prompt_sent_at.zip(state.terminal_response_at).map(|(start, end)| elapsed_ms(start, end)),
+            "terminalResponseToObservedLegacyPublicationMs": state.terminal_response_at.zip(state.legacy_publication_observed_at).map(|(start, end)| signed_elapsed_ms(start, end)),
+            "inboundAdmittedToObservedLegacyPublicationMs": state.legacy_publication_observed_at.map(|at| elapsed_ms(self.inbound_admitted_at, at)),
+            "sessionWasNew": state.session_was_new,
+        })
+    }
+}
+
 static TELEMETRY_HMAC_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 
 pub(crate) fn initialize_telemetry_hmac_key(key: [u8; 32]) {
@@ -604,6 +675,8 @@ pub struct AcpClient {
     last_completed_prompt_result: Option<PromptTurnResult>,
     /// Exactly-once guard for terminal classification across prompt and cancel drain.
     final_answer_classification_emitted: bool,
+    /// Gate A1 monotonic timing state for the active prompt turn.
+    turn_timing: Option<std::sync::Arc<TurnTimingMetadata>>,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -967,6 +1040,7 @@ impl AcpClient {
             active_prompt_session_id: None,
             last_completed_prompt_result: None,
             final_answer_classification_emitted: false,
+            turn_timing: None,
         })
     }
 
@@ -974,6 +1048,16 @@ impl AcpClient {
     pub fn set_observer(&mut self, observer: Option<ObserverHandle>, agent_index: usize) {
         self.observer = observer;
         self.observer_agent_index = Some(agent_index);
+    }
+
+    pub(crate) fn set_turn_timing(&mut self, timing: Option<std::sync::Arc<TurnTimingMetadata>>) {
+        self.turn_timing = timing;
+    }
+
+    pub(crate) fn set_turn_session_was_new(&self, session_was_new: bool) {
+        if let Some(timing) = self.turn_timing.as_ref() {
+            timing.set_session_was_new(session_was_new);
+        }
     }
 
     /// Update metadata that will be attached to subsequent raw wire events.
@@ -1254,6 +1338,9 @@ impl AcpClient {
             self.emit_final_answer_classification(StopReasonClassification::InternalError);
             return Err(e);
         }
+        if let Some(timing) = self.turn_timing.as_ref() {
+            timing.record_prompt_sent_at(std::time::Instant::now());
+        }
 
         let result = self
             .read_until_response_with_idle_timeout(
@@ -1331,7 +1418,15 @@ impl AcpClient {
             .final_answer_collector
             .finish_classification(stop_reason);
         if !self.final_answer_classification_emitted {
-            self.observe("final_answer_classification", observation.telemetry());
+            let mut payload = observation.telemetry();
+            if let (Some(payload), Some(timing)) =
+                (payload.as_object_mut(), self.turn_timing.as_ref())
+            {
+                if let Some(timing) = timing.telemetry().as_object() {
+                    payload.extend(timing.clone());
+                }
+            }
+            self.observe("final_answer_classification", payload);
             self.final_answer_classification_emitted = true;
         }
         observation
@@ -2211,6 +2306,9 @@ impl AcpClient {
                                 }
                             }
                             if *id == serde_json::json!(expected_id) {
+                                if let Some(timing) = self.turn_timing.as_ref() {
+                                    timing.record_terminal_response_at(std::time::Instant::now());
+                                }
                                 if let Some(error) = msg.get("error") {
                                     if let Some((_, _, ack_tx)) = pending_steer.take() {
                                         let _ = ack_tx
@@ -5431,6 +5529,48 @@ mod tests {
     }
 
     #[test]
+    fn turn_timing_reports_all_a1_intervals_and_session_reuse() {
+        let admitted = std::time::Instant::now();
+        let timing = TurnTimingMetadata::new(admitted);
+        timing.set_session_was_new(false);
+        timing.record_prompt_sent_at(admitted + std::time::Duration::from_millis(125));
+        timing.record_terminal_response_at(admitted + std::time::Duration::from_millis(725));
+        timing.record_legacy_publication_observed_at(
+            admitted + std::time::Duration::from_millis(925),
+        );
+
+        assert_eq!(
+            timing.telemetry(),
+            serde_json::json!({
+                "inboundAdmittedToPromptSentMs": 125,
+                "promptSentToTerminalResponseMs": 600,
+                "terminalResponseToObservedLegacyPublicationMs": 200,
+                "inboundAdmittedToObservedLegacyPublicationMs": 925,
+                "sessionWasNew": false,
+            })
+        );
+    }
+
+    #[test]
+    fn turn_timing_preserves_publication_before_terminal_order() {
+        let admitted = std::time::Instant::now();
+        let timing = TurnTimingMetadata::new(admitted);
+        timing.set_session_was_new(true);
+        timing.record_prompt_sent_at(admitted + std::time::Duration::from_millis(50));
+        timing.record_legacy_publication_observed_at(
+            admitted + std::time::Duration::from_millis(300),
+        );
+        timing.record_terminal_response_at(admitted + std::time::Duration::from_millis(450));
+
+        let telemetry = timing.telemetry();
+        assert_eq!(
+            telemetry["terminalResponseToObservedLegacyPublicationMs"],
+            -150
+        );
+        assert_eq!(telemetry["sessionWasNew"], true);
+    }
+
+    #[test]
     fn telemetry_hmac_key_is_persisted_and_reused() {
         let dir = std::env::temp_dir().join(format!("buzz-acp-hmac-{}", uuid::Uuid::new_v4()));
         let path = dir.join("telemetry-hmac.key");
@@ -5486,6 +5626,9 @@ mod tests {
         let observer = ObserverHandle::in_process();
         let mut client = spawn_script("read _; sleep 1").await;
         client.set_observer(Some(observer.clone()), 0);
+        client.set_turn_timing(Some(std::sync::Arc::new(TurnTimingMetadata::new(
+            std::time::Instant::now(),
+        ))));
 
         let error = client
             .session_prompt_turn_with_idle_timeout(
@@ -5512,6 +5655,15 @@ mod tests {
         );
         assert_eq!(
             classifications[0].payload["contentHmacSha256"],
+            serde_json::Value::Null
+        );
+        assert!(classifications[0].payload["inboundAdmittedToPromptSentMs"].is_number());
+        assert_eq!(
+            classifications[0].payload["promptSentToTerminalResponseMs"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            classifications[0].payload["terminalResponseToObservedLegacyPublicationMs"],
             serde_json::Value::Null
         );
         client.shutdown().await;
@@ -5935,10 +6087,15 @@ mod tests {
 
     #[tokio::test]
     async fn session_prompt_returns_typed_final_answer_from_wire() {
+        let observer = ObserverHandle::in_process();
         let mut client = spawn_script(
             r#"read _; printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-other","update":{"sessionUpdate":"agent_message_chunk","messageId":"wrong-session","content":{"type":"text","text":"wrong"},"_meta":{"codex":{"phase":"final_answer"}}}}}' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"missing-session","content":{"type":"text","text":"wrong"},"_meta":{"codex":{"phase":"final_answer"}}}}}' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","messageId":"message-1","content":{"type":"text","text":"hello"},"_meta":{"codex":{"phase":"final_answer"}}}}}' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'; sleep 1"#,
         )
         .await;
+        client.set_observer(Some(observer.clone()), 0);
+        let timing = std::sync::Arc::new(TurnTimingMetadata::new(std::time::Instant::now()));
+        timing.set_session_was_new(true);
+        client.set_turn_timing(Some(timing));
 
         let result = client
             .session_prompt_turn_with_idle_timeout(
@@ -5963,6 +6120,18 @@ mod tests {
                 message_id: "message-1".into(),
                 text: "hello".into(),
             })
+        );
+        let classification = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == "final_answer_classification")
+            .expect("classification event");
+        assert!(classification.payload["inboundAdmittedToPromptSentMs"].is_number());
+        assert!(classification.payload["promptSentToTerminalResponseMs"].is_number());
+        assert_eq!(classification.payload["sessionWasNew"], true);
+        assert_eq!(
+            classification.payload["terminalResponseToObservedLegacyPublicationMs"],
+            serde_json::Value::Null
         );
     }
 

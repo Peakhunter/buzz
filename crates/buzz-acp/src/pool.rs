@@ -77,6 +77,8 @@ pub struct TaskMeta {
     /// live session. The session ID prevents a late ack from contaminating a
     /// replacement session after task return.
     pub successful_steer_deliveries: HashSet<SuccessfulSteerDelivery>,
+    /// Gate A1 monotonic timing shared with ACP and legacy attribution.
+    pub turn_timing: Option<Arc<crate::acp::TurnTimingMetadata>>,
 }
 
 /// Agent-level model capabilities. Populated on first session creation.
@@ -1479,6 +1481,9 @@ pub async fn run_prompt_task(
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
     };
+    if matches!(source, PromptSource::Heartbeat) {
+        agent.acp.set_turn_timing(None);
+    }
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
@@ -1779,6 +1784,7 @@ pub async fn run_prompt_task(
             }
         }
     };
+    agent.acp.set_turn_session_was_new(is_new_session);
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         Some(session_id.clone()),

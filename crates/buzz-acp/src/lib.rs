@@ -72,6 +72,7 @@ const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 struct LegacyObservationCandidate<'a> {
     turn_id: &'a str,
     channel_id: Option<Uuid>,
+    timing: Option<&'a std::sync::Arc<acp::TurnTimingMetadata>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -89,18 +90,25 @@ struct ObservedLegacyPublication {
     confidence: LegacyAttributionConfidence,
     ambiguous: bool,
     safety_barrier_evidence: bool,
+    turn_timing: serde_json::Value,
 }
 
 impl ObservedLegacyPublication {
     fn telemetry(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "eventId": self.event_id,
             "contentBytes": self.content_bytes,
             "contentHmacSha256": self.content_hmac_sha256,
             "confidence": self.confidence,
             "ambiguous": self.ambiguous,
             "safetyBarrierEvidence": self.safety_barrier_evidence,
-        })
+        });
+        if let (Some(payload), Some(timing)) =
+            (payload.as_object_mut(), self.turn_timing.as_object())
+        {
+            payload.extend(timing.clone());
+        }
+        payload
     }
 }
 
@@ -125,6 +133,15 @@ fn observe_legacy_publication<'a>(
         .filter(|candidate| candidate.channel_id == Some(channel_id));
     let candidate = matching.next()?;
     let ambiguous = matching.next().is_some();
+    let observed_at = std::time::Instant::now();
+    let turn_timing = if ambiguous {
+        serde_json::json!({})
+    } else if let Some(timing) = candidate.timing {
+        timing.record_legacy_publication_observed_at(observed_at);
+        timing.telemetry()
+    } else {
+        serde_json::json!({})
+    };
     Some(ObservedLegacyPublication {
         turn_id: (!ambiguous).then(|| candidate.turn_id.to_owned()),
         event_id: event.id.to_hex(),
@@ -140,6 +157,7 @@ fn observe_legacy_publication<'a>(
         },
         ambiguous,
         safety_barrier_evidence: false,
+        turn_timing,
     })
 }
 
@@ -2433,6 +2451,7 @@ async fn tokio_main() -> Result<()> {
                                         pool.task_map().values().map(|meta| LegacyObservationCandidate {
                                             turn_id: &meta.turn_id,
                                             channel_id: meta.channel_id,
+                                            timing: meta.turn_timing.as_ref(),
                                         }),
                                     ) {
                                         if let Some(observer) = observer.as_ref() {
@@ -3409,6 +3428,17 @@ fn dispatch_pending(
             DedupMode::Drop => None,
         };
 
+        let inbound_admitted_at = batch
+            .events
+            .iter()
+            .map(|event| event.received_at)
+            .min()
+            .unwrap_or_else(std::time::Instant::now);
+        let turn_timing = std::sync::Arc::new(acp::TurnTimingMetadata::new(inbound_admitted_at));
+        agent
+            .acp
+            .set_turn_timing(Some(std::sync::Arc::clone(&turn_timing)));
+
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
         let agent_index = agent.index;
@@ -3455,6 +3485,7 @@ fn dispatch_pending(
                 control_tx: Some(control_tx),
                 steer_tx,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: Some(turn_timing),
             },
         );
         dispatched_channels.push((channel_id, typing_scope));
@@ -4100,6 +4131,7 @@ fn dispatch_heartbeat(
             control_tx: None,
             steer_tx: None,
             successful_steer_deliveries: HashSet::new(),
+            turn_timing: None,
         },
     );
     *heartbeat_in_flight = true;
@@ -4905,6 +4937,7 @@ mod owner_control_command_tests {
                 control_tx: Some(control_tx),
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: None,
             },
         );
 
@@ -6665,6 +6698,11 @@ mod error_outcome_emission_tests {
             .expect("signed event");
 
         let telemetry_key = [7_u8; 32];
+        let admitted = std::time::Instant::now();
+        let timing = std::sync::Arc::new(acp::TurnTimingMetadata::new(admitted));
+        timing.set_session_was_new(false);
+        timing.record_prompt_sent_at(admitted);
+        timing.record_terminal_response_at(admitted);
         let observed = observe_legacy_publication(
             channel_id,
             &event,
@@ -6673,6 +6711,7 @@ mod error_outcome_emission_tests {
             [LegacyObservationCandidate {
                 turn_id: "turn-1",
                 channel_id: Some(channel_id),
+                timing: Some(&timing),
             }],
         )
         .expect("single in-flight channel turn is attributable");
@@ -6690,6 +6729,10 @@ mod error_outcome_emission_tests {
         );
         assert!(!observed.ambiguous);
         assert!(!observed.safety_barrier_evidence);
+        let observed_telemetry = observed.telemetry();
+        assert!(observed_telemetry["inboundAdmittedToObservedLegacyPublicationMs"].is_number());
+        assert!(observed_telemetry["terminalResponseToObservedLegacyPublicationMs"].is_number());
+        assert_eq!(observed_telemetry["sessionWasNew"], false);
         let serialized = serde_json::to_string(&observed.telemetry()).expect("telemetry JSON");
         assert!(!serialized.contains("private published reply"));
         assert!(!serialized.contains(&hex::encode(sha2::Sha256::digest(event.content.as_bytes()))));
@@ -6712,6 +6755,7 @@ mod error_outcome_emission_tests {
             [LegacyObservationCandidate {
                 turn_id: "turn-1",
                 channel_id: Some(channel_id),
+                timing: None,
             }],
         )
         .is_none());
@@ -6725,10 +6769,12 @@ mod error_outcome_emission_tests {
                 LegacyObservationCandidate {
                     turn_id: "turn-1",
                     channel_id: Some(channel_id),
+                    timing: None,
                 },
                 LegacyObservationCandidate {
                     turn_id: "turn-2",
                     channel_id: Some(channel_id),
+                    timing: None,
                 },
             ],
         )
@@ -6794,6 +6840,7 @@ mod error_outcome_emission_tests {
                         session_id: "live-session".into(),
                     },
                 ]),
+                turn_timing: None,
             },
         );
 
@@ -6867,6 +6914,7 @@ mod error_outcome_emission_tests {
                         session_id: "old-session".into(),
                     },
                 ]),
+                turn_timing: None,
             },
         );
 
@@ -6983,6 +7031,7 @@ mod error_outcome_emission_tests {
                         session_id: "invalidated-session".into(),
                     },
                 ]),
+                turn_timing: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7044,6 +7093,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: None,
             },
         );
 
@@ -7122,6 +7172,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: None,
             },
         );
         started_rx.await.unwrap();
@@ -7215,6 +7266,7 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     successful_steer_deliveries: HashSet::new(),
+                    turn_timing: None,
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7308,6 +7360,7 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     successful_steer_deliveries: HashSet::new(),
+                    turn_timing: None,
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7415,6 +7468,7 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     successful_steer_deliveries: HashSet::new(),
+                    turn_timing: None,
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7493,6 +7547,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7589,6 +7644,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: None,
             },
         );
         let config = test_config();
@@ -7707,6 +7763,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7848,6 +7905,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -8038,6 +8096,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -8125,6 +8184,7 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                turn_timing: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
