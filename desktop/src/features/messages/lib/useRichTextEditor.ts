@@ -29,6 +29,8 @@ import {
 import { CUSTOM_EMOJI_NODE_NAME } from "./customEmojiNode";
 import { useComposerCustomEmoji } from "./useComposerCustomEmoji";
 import { buildPlainTextProjection } from "./plainTextProjection";
+import { parseSnapshotClipboardHtml } from "./agentSnapshotClipboard";
+import { buildPreviewUpdate } from "./linkPreviewContent";
 import { createLinkInteractionExtension } from "./linkInteractionExtension";
 import { handleMentionBoundaryBeforeInput } from "./mentionBoundaryBeforeInput";
 import {
@@ -37,6 +39,9 @@ import {
   insertNewlineInCodeBlock,
 } from "./codeBlockExtensions";
 import { SpoilerMark } from "./spoilerMark";
+import { createComposerLinkPasteHandler } from "./composerMessageLinkNode";
+import type { ComposerMessageLinkChannel } from "./useComposerMessageLinks";
+import { useComposerMessageLinks } from "./useComposerMessageLinks";
 
 function hardBreakLineBounds($from: ResolvedPos) {
   const parentStart = $from.start();
@@ -77,11 +82,12 @@ export type AutocompleteEdit = {
 
 export type RichTextEditorOptions = {
   placeholder?: string;
-  onUpdate?: (info: { text: string; cursor: number }) => void;
+  onUpdate?: (info: ReturnType<typeof buildPreviewUpdate>) => void;
   editable?: boolean;
   mentionNames?: string[];
   agentMentionNames?: string[];
   channelNames?: string[];
+  messageLinkChannels?: readonly ComposerMessageLinkChannel[];
   /** Known custom-emoji set; used to render `:shortcode:` inline as images. */
   customEmoji?: CustomEmoji[];
   /** Called on plain Enter (submit). Handled inside Tiptap's extension system
@@ -200,6 +206,7 @@ export function useRichTextEditor({
   mentionNames,
   agentMentionNames,
   channelNames,
+  messageLinkChannels,
   customEmoji,
   onSubmit,
   onEditLastOwnMessage,
@@ -232,6 +239,7 @@ export function useRichTextEditor({
   // Custom-emoji atom node wiring (config + src re-resolve). Kept in a sibling
   // hook so this file stays focused on generic editor setup.
   const customEmojiWiring = useComposerCustomEmoji(customEmoji);
+  const messageLinkWiring = useComposerMessageLinks(messageLinkChannels);
 
   const editor = useEditor(
     {
@@ -456,6 +464,7 @@ export function useRichTextEditor({
         SpoilerMark,
         MentionHighlightExtension,
         customEmojiWiring.extension,
+        messageLinkWiring.extension,
         Placeholder.configure({
           placeholder: () => placeholderRef.current ?? "Write a message…",
         }),
@@ -488,16 +497,25 @@ export function useRichTextEditor({
         }),
       ],
       editorProps: {
+        handleDOMEvents: {
+          paste: (view, event) =>
+            parseSnapshotClipboardHtml(
+              (event as ClipboardEvent).clipboardData?.getData("text/html") ??
+                "",
+            )
+              ? false
+              : createComposerLinkPasteHandler(
+                  messageLinkWiring.resolveChannelName,
+                )(view, event as ClipboardEvent),
+          beforeinput: (view, event) =>
+            handleMentionBoundaryBeforeInput(view, event as InputEvent),
+        },
         attributes: {
           autocapitalize: "none",
           autocorrect: "off",
           class: `${MESSAGE_MARKDOWN_CLASS} min-h-0 resize-none overflow-y-hidden border-0 bg-transparent px-0 py-0 text-sm leading-5 text-foreground shadow-none focus-visible:ring-0 caret-foreground outline-hidden max-w-none`,
           "data-testid": "message-input",
           spellcheck: "true",
-        },
-        handleDOMEvents: {
-          beforeinput: (view, event) =>
-            handleMentionBoundaryBeforeInput(view, event as InputEvent),
         },
         // ArrowUp in an empty composer → edit your last message (Slack
         // parity). Handled here in ProseMirror's own DOM `keydown` hook —
@@ -624,11 +642,9 @@ export function useRichTextEditor({
         // still available through `getMarkdown()` for send/draft boundaries;
         // per-keystroke consumers only need textarea-shaped plain text for
         // autocomplete and empty/non-empty state.
-        const projection = buildPlainTextProjection(ed.state.doc);
-        onUpdateRef.current?.({
-          cursor: projection.mapPMToTextOffset(ed.state.selection.anchor),
-          text: projection.text,
-        });
+        onUpdateRef.current?.(
+          buildPreviewUpdate(ed.state.doc, ed.state.selection.anchor),
+        );
       },
     },
     [],
@@ -701,6 +717,11 @@ export function useRichTextEditor({
     if (!editor) return;
     customEmojiWiring.syncEmojiSrc(editor);
   }, [editor, customEmojiWiring.syncEmojiSrc]);
+
+  React.useEffect(() => {
+    if (!editor) return;
+    messageLinkWiring.syncChannelNames(editor);
+  }, [editor, messageLinkWiring.syncChannelNames]);
 
   const getMarkdown = React.useCallback((): string => {
     if (!editor) return "";
