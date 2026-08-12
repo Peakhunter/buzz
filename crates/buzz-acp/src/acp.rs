@@ -9,12 +9,22 @@
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
 use futures_util::StreamExt;
+use hmac::{Hmac, KeyInit, Mac};
+#[cfg(test)]
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::observer::{ObserverContext, ObserverHandle};
 use crate::usage::{TurnUsage, UsageTracker};
+
+static TELEMETRY_HMAC_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+pub(crate) fn initialize_telemetry_hmac_key(key: [u8; 32]) {
+    let _ = TELEMETRY_HMAC_KEY.set(key);
+}
 
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
@@ -89,6 +99,53 @@ pub struct FinalAnswer {
     pub text: String,
 }
 
+/// Content-free classification result for shadow telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalAnswerReason {
+    Accepted,
+    NoFinalChunks,
+    EmptyText,
+    InvalidMessageId,
+    AmbiguousMessageIds,
+    MalformedContent,
+    MalformedWire,
+    ToolBoundaryInvalidated,
+    NonEndTurn,
+    NoncanonicalEndTurn,
+    ByteLimitExceeded,
+    ChunkLimitExceeded,
+    InternalError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReasonClassification {
+    ExactEndTurn,
+    NoncanonicalEndTurn,
+    NonEndTurn,
+    InternalError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalAnswerObservation {
+    answer: Option<FinalAnswer>,
+    reason: FinalAnswerReason,
+    exact_end_turn: bool,
+    content_bytes: Option<usize>,
+    content_hmac_sha256: Option<String>,
+}
+
+impl FinalAnswerObservation {
+    pub fn telemetry(&self) -> serde_json::Value {
+        serde_json::json!({
+            "reason": self.reason,
+            "exactEndTurn": self.exact_end_turn,
+            "contentBytes": self.content_bytes,
+            "contentHmacSha256": self.content_hmac_sha256,
+        })
+    }
+}
+
 /// Typed result of one terminal `session/prompt` response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptTurnResult {
@@ -105,8 +162,10 @@ struct FinalAnswerCollector {
     observed_bytes: usize,
     observed_chunks: usize,
     candidate_invalid: bool,
-    limit_exceeded: bool,
+    limit_reason: Option<FinalAnswerReason>,
     wire_invalid: bool,
+    invalid_reason: Option<FinalAnswerReason>,
+    tool_boundary_invalidated: bool,
 }
 
 impl FinalAnswerCollector {
@@ -118,15 +177,15 @@ impl FinalAnswerCollector {
             == Some("final_answer");
 
         if is_final_answer {
-            if self.limit_exceeded || self.wire_invalid {
+            if self.limit_reason.is_some() || self.wire_invalid {
                 return;
             }
-            if !self.account_relevant_chunk(update) {
-                self.exceed_limit();
+            if let Err(reason) = self.account_relevant_chunk(update) {
+                self.exceed_limit(reason);
                 return;
             }
             if update_type != Some("agent_message_chunk") {
-                self.invalidate_candidate();
+                self.invalidate_candidate(FinalAnswerReason::MalformedContent);
                 return;
             }
             if self.candidate_invalid {
@@ -138,7 +197,7 @@ impl FinalAnswerCollector {
                 .and_then(|value| value.as_str())
                 .filter(|value| !value.trim().is_empty())
             else {
-                self.invalidate_candidate();
+                self.invalidate_candidate(FinalAnswerReason::InvalidMessageId);
                 return;
             };
             if update
@@ -146,14 +205,14 @@ impl FinalAnswerCollector {
                 .and_then(|value| value.as_str())
                 != Some("text")
             {
-                self.invalidate_candidate();
+                self.invalidate_candidate(FinalAnswerReason::MalformedContent);
                 return;
             }
             let Some(text) = update
                 .pointer("/content/text")
                 .and_then(|value| value.as_str())
             else {
-                self.invalidate_candidate();
+                self.invalidate_candidate(FinalAnswerReason::MalformedContent);
                 return;
             };
 
@@ -177,17 +236,24 @@ impl FinalAnswerCollector {
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| !value.trim().is_empty())
             {
+                if !self.groups.is_empty() {
+                    self.tool_boundary_invalidated = true;
+                }
                 self.groups.clear();
                 self.candidate_invalid = false;
+                self.invalid_reason = None;
             } else {
-                self.invalidate_candidate();
+                self.invalidate_candidate(FinalAnswerReason::MalformedContent);
             }
         }
     }
 
-    fn account_relevant_chunk(&mut self, update: &serde_json::Value) -> bool {
+    fn account_relevant_chunk(
+        &mut self,
+        update: &serde_json::Value,
+    ) -> Result<(), FinalAnswerReason> {
         let Some(observed_chunks) = self.observed_chunks.checked_add(1) else {
-            return false;
+            return Err(FinalAnswerReason::ChunkLimitExceeded);
         };
         let material_bytes = update
             .get("messageId")
@@ -199,24 +265,28 @@ impl FinalAnswerCollector {
         let Some(observed_bytes) =
             material_bytes.and_then(|bytes| self.observed_bytes.checked_add(bytes))
         else {
-            return false;
+            return Err(FinalAnswerReason::ByteLimitExceeded);
         };
-        if observed_bytes > MAX_FINAL_ANSWER_BYTES || observed_chunks > MAX_FINAL_ANSWER_CHUNKS {
-            return false;
+        if observed_chunks > MAX_FINAL_ANSWER_CHUNKS {
+            return Err(FinalAnswerReason::ChunkLimitExceeded);
+        }
+        if observed_bytes > MAX_FINAL_ANSWER_BYTES {
+            return Err(FinalAnswerReason::ByteLimitExceeded);
         }
         self.observed_bytes = observed_bytes;
         self.observed_chunks = observed_chunks;
-        true
+        Ok(())
     }
 
-    fn invalidate_candidate(&mut self) {
+    fn invalidate_candidate(&mut self, reason: FinalAnswerReason) {
         self.groups.clear();
         self.candidate_invalid = true;
+        self.invalid_reason.get_or_insert(reason);
     }
 
-    fn exceed_limit(&mut self) {
-        self.invalidate_candidate();
-        self.limit_exceeded = true;
+    fn exceed_limit(&mut self, reason: FinalAnswerReason) {
+        self.invalidate_candidate(reason);
+        self.limit_reason = Some(reason);
     }
 
     fn observe_unparseable_line(&mut self, bytes: usize) {
@@ -231,28 +301,160 @@ impl FinalAnswerCollector {
                 self.observed_chunks = chunks;
                 self.observed_bytes = total_bytes;
             }
-            _ => self.limit_exceeded = true,
+            Some((chunks, _)) if chunks > MAX_FINAL_ANSWER_CHUNKS => {
+                self.limit_reason = Some(FinalAnswerReason::ChunkLimitExceeded);
+            }
+            _ => self.limit_reason = Some(FinalAnswerReason::ByteLimitExceeded),
         }
-        self.invalidate_candidate();
+        self.invalidate_candidate(FinalAnswerReason::MalformedWire);
         self.wire_invalid = true;
     }
 
+    #[cfg(test)]
     fn finish(&mut self, exact_end_turn: bool) -> Option<FinalAnswer> {
-        let answer = if !self.candidate_invalid
-            && !self.limit_exceeded
-            && !self.wire_invalid
-            && exact_end_turn
-            && self.groups.len() == 1
-        {
-            self.groups
-                .pop()
-                .filter(|answer| !answer.text.trim().is_empty())
+        let classification = if exact_end_turn {
+            StopReasonClassification::ExactEndTurn
+        } else {
+            StopReasonClassification::NonEndTurn
+        };
+        self.finish_classification(classification).answer
+    }
+
+    fn finish_classification(
+        &mut self,
+        stop_reason: StopReasonClassification,
+    ) -> FinalAnswerObservation {
+        let exact_end_turn = stop_reason == StopReasonClassification::ExactEndTurn;
+        let reason = if stop_reason == StopReasonClassification::InternalError {
+            FinalAnswerReason::InternalError
+        } else if stop_reason == StopReasonClassification::NoncanonicalEndTurn {
+            FinalAnswerReason::NoncanonicalEndTurn
+        } else if stop_reason == StopReasonClassification::NonEndTurn {
+            FinalAnswerReason::NonEndTurn
+        } else if self.wire_invalid {
+            FinalAnswerReason::MalformedWire
+        } else if let Some(reason) = self.limit_reason {
+            reason
+        } else if self.candidate_invalid {
+            self.invalid_reason
+                .unwrap_or(FinalAnswerReason::MalformedContent)
+        } else if self.groups.len() > 1 {
+            FinalAnswerReason::AmbiguousMessageIds
+        } else if self.groups.is_empty() {
+            if self.tool_boundary_invalidated {
+                FinalAnswerReason::ToolBoundaryInvalidated
+            } else {
+                FinalAnswerReason::NoFinalChunks
+            }
+        } else if self.groups[0].text.trim().is_empty() {
+            FinalAnswerReason::EmptyText
+        } else {
+            FinalAnswerReason::Accepted
+        };
+        let answer = if reason == FinalAnswerReason::Accepted {
+            self.groups.pop()
         } else {
             None
         };
+        let content_bytes = answer.as_ref().map(|answer| answer.text.len());
+        let content_hmac_sha256 = answer
+            .as_ref()
+            .and_then(|answer| installed_telemetry_content_hmac(answer.text.as_bytes()));
         *self = Self::default();
-        answer
+        FinalAnswerObservation {
+            answer,
+            reason,
+            exact_end_turn,
+            content_bytes,
+            content_hmac_sha256,
+        }
     }
+}
+
+pub(crate) fn telemetry_content_hmac(key: &[u8; 32], content: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(b"buzz-acp/a1/content/v1\0");
+    mac.update(content);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+pub(crate) fn load_or_create_telemetry_hmac_key(
+    path: &std::path::Path,
+) -> Result<[u8; 32], std::io::Error> {
+    use rand::RngExt;
+    use std::io::{Read, Write};
+
+    let read_existing = || {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(nix::libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "telemetry HMAC key must be a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            if metadata.uid() != nix::unistd::geteuid().as_raw() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "telemetry HMAC key must be owned by the current user",
+                ));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        let mut key = [0_u8; 32];
+        file.read_exact(&mut key)?;
+        let mut trailing = [0_u8; 1];
+        if file.read(&mut trailing)? != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "telemetry HMAC key must contain exactly 32 bytes",
+            ));
+        }
+        Ok(key)
+    };
+    match read_existing() {
+        Ok(key) => return Ok(key),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let key: [u8; 32] = rand::rng().random();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(&key)?;
+            file.sync_all()?;
+            Ok(key)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_existing(),
+        Err(error) => Err(error),
+    }
+}
+
+fn installed_telemetry_content_hmac(content: &[u8]) -> Option<String> {
+    TELEMETRY_HMAC_KEY
+        .get()
+        .map(|key| telemetry_content_hmac(key, content))
 }
 
 /// Errors that can occur in the ACP client.
@@ -400,6 +602,8 @@ pub struct AcpClient {
     /// the prompt/control race where `select!` can drop an already-completed
     /// prompt future after `last_prompt_id` was cleared.
     last_completed_prompt_result: Option<PromptTurnResult>,
+    /// Exactly-once guard for terminal classification across prompt and cancel drain.
+    final_answer_classification_emitted: bool,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -762,6 +966,7 @@ impl AcpClient {
             final_answer_collector: FinalAnswerCollector::default(),
             active_prompt_session_id: None,
             last_completed_prompt_result: None,
+            final_answer_classification_emitted: false,
         })
     }
 
@@ -1019,6 +1224,7 @@ impl AcpClient {
         self.active_prompt_session_id = None;
         self.final_answer_collector = FinalAnswerCollector::default();
         self.last_completed_prompt_result = None;
+        self.final_answer_classification_emitted = false;
         self.active_prompt_session_id = Some(session_id.to_owned());
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
@@ -1045,7 +1251,7 @@ impl AcpClient {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
             self.active_prompt_session_id = None;
-            self.final_answer_collector = FinalAnswerCollector::default();
+            self.emit_final_answer_classification(StopReasonClassification::InternalError);
             return Err(e);
         }
 
@@ -1079,23 +1285,31 @@ impl AcpClient {
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                self.final_answer_collector = FinalAnswerCollector::default();
+                self.emit_final_answer_classification(StopReasonClassification::InternalError);
                 return Err(error);
             }
         };
         // Codex ACP 1.1.14 calls waitForSessionNotifications(sessionId) before
         // returning session/prompt, so this response is the verified adapter's
         // terminal turn boundary. ACP updates expose no separate turn ID.
-        let exact_end_turn =
-            result.get("stopReason").and_then(|value| value.as_str()) == Some("end_turn");
+        let stop_reason_classification =
+            match result.get("stopReason").and_then(|value| value.as_str()) {
+                Some("end_turn") => StopReasonClassification::ExactEndTurn,
+                Some(value) if value.eq_ignore_ascii_case("end_turn") => {
+                    StopReasonClassification::NoncanonicalEndTurn
+                }
+                _ => StopReasonClassification::NonEndTurn,
+            };
         let stop_reason = match self.parse_stop_reason(&result) {
             Ok(stop_reason) => stop_reason,
             Err(error) => {
-                self.final_answer_collector = FinalAnswerCollector::default();
+                self.emit_final_answer_classification(StopReasonClassification::InternalError);
                 return Err(error);
             }
         };
-        let final_answer = self.final_answer_collector.finish(exact_end_turn);
+        let final_answer_observation =
+            self.emit_final_answer_classification(stop_reason_classification);
+        let final_answer = final_answer_observation.answer.clone();
         let turn_result = PromptTurnResult {
             stop_reason,
             final_answer,
@@ -1107,6 +1321,20 @@ impl AcpClient {
     /// Consume the most recently completed typed prompt result, if any.
     pub fn take_completed_prompt_result(&mut self) -> Option<PromptTurnResult> {
         self.last_completed_prompt_result.take()
+    }
+
+    fn emit_final_answer_classification(
+        &mut self,
+        stop_reason: StopReasonClassification,
+    ) -> FinalAnswerObservation {
+        let observation = self
+            .final_answer_collector
+            .finish_classification(stop_reason);
+        if !self.final_answer_classification_emitted {
+            self.observe("final_answer_classification", observation.telemetry());
+            self.final_answer_classification_emitted = true;
+        }
+        observation
     }
 
     /// Send a `session/cancel` **notification** (no `id` field, no response expected).
@@ -1298,14 +1526,16 @@ impl AcpClient {
             AcpError::Protocol("cancel_with_cleanup called with no in-flight prompt".into())
         })?;
         self.active_prompt_session_id = None;
-        self.final_answer_collector = FinalAnswerCollector::default();
 
         // Step 1: respond to any pending permission request with "cancelled",
         // but only if we haven't already responded (guards against double-response race).
         if let Some(perm_id) = self.pending_permission_id.clone() {
             if !self.permission_responded {
                 let response = permission_response_cancelled(&perm_id);
-                self.write_ndjson(&response).await?;
+                if let Err(error) = self.write_ndjson(&response).await {
+                    self.emit_final_answer_classification(StopReasonClassification::InternalError);
+                    return Err(error);
+                }
                 tracing::debug!(
                     target: "acp::cancel",
                     "responded cancelled to pending permission id={perm_id}"
@@ -1316,7 +1546,10 @@ impl AcpClient {
         }
 
         // Step 2: send session/cancel notification (no id)
-        self.session_cancel(session_id).await?;
+        if let Err(error) = self.session_cancel(session_id).await {
+            self.emit_final_answer_classification(StopReasonClassification::InternalError);
+            return Err(error);
+        }
         tracing::info!(target: "acp::cancel", "sent session/cancel for {session_id}");
         // Use a fixed 30s idle timeout during cleanup — the cancel notification
         // needs time to propagate and the agent may go silent while winding down.
@@ -1326,7 +1559,7 @@ impl AcpClient {
         let remaining = hard_deadline
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default();
-        let result = self
+        let result = match self
             .read_until_response_with_idle_timeout(
                 session_id,
                 prompt_id,
@@ -1334,8 +1567,30 @@ impl AcpClient {
                 hard_deadline,
                 remaining,
             )
-            .await?;
-        self.parse_stop_reason(&result)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.emit_final_answer_classification(StopReasonClassification::InternalError);
+                return Err(error);
+            }
+        };
+        let stop_reason = match self.parse_stop_reason(&result) {
+            Ok(stop_reason) => stop_reason,
+            Err(error) => {
+                self.emit_final_answer_classification(StopReasonClassification::InternalError);
+                return Err(error);
+            }
+        };
+        let classification = match result.get("stopReason").and_then(|value| value.as_str()) {
+            Some("end_turn") => StopReasonClassification::ExactEndTurn,
+            Some(value) if value.eq_ignore_ascii_case("end_turn") => {
+                StopReasonClassification::NoncanonicalEndTurn
+            }
+            _ => StopReasonClassification::NonEndTurn,
+        };
+        self.emit_final_answer_classification(classification);
+        Ok(stop_reason)
     }
 
     /// Serialize `value` as a single NDJSON line and flush to the agent's stdin.
@@ -3398,6 +3653,8 @@ mod tests {
         // Agent ignores `session/cancel` on stdin and keeps producing noise
         // forever — never drains within the grace window.
         let mut client = spawn_script("while true; do echo 'noise'; sleep 0.01; done").await;
+        let observer = ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
         client.last_prompt_id = Some(999);
         let grace = std::time::Duration::from_millis(200);
         let result = client
@@ -3407,6 +3664,13 @@ mod tests {
             matches!(result, Err(AcpError::CancelDrainTimeout(g)) if g == grace),
             "expected CancelDrainTimeout({grace:?}), got {result:?}"
         );
+        let classifications: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "final_answer_classification")
+            .collect();
+        assert_eq!(classifications.len(), 1);
+        assert_eq!(classifications[0].payload["reason"], "internal_error");
     }
 
     #[tokio::test]
@@ -5031,6 +5295,334 @@ mod tests {
     }
 
     #[test]
+    fn shadow_classification_reports_bounded_metadata_without_response_text() {
+        let mut accepted = FinalAnswerCollector::default();
+        accepted.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-1",
+            "content": {"type": "text", "text": "private response"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+
+        let observation = accepted.finish_classification(StopReasonClassification::ExactEndTurn);
+        assert_eq!(observation.reason, FinalAnswerReason::Accepted);
+        assert!(observation.exact_end_turn);
+        assert_eq!(
+            observation
+                .answer
+                .as_ref()
+                .map(|answer| answer.text.as_str()),
+            Some("private response")
+        );
+        assert_eq!(observation.content_bytes, Some(16));
+        assert_eq!(
+            observation.content_hmac_sha256.as_deref(),
+            installed_telemetry_content_hmac(b"private response").as_deref()
+        );
+        let serialized = serde_json::to_string(&observation.telemetry()).expect("telemetry JSON");
+        assert!(!serialized.contains("private response"));
+        assert!(!serialized.contains("message-1"));
+
+        let mut absent = FinalAnswerCollector::default();
+        let observation = absent.finish_classification(StopReasonClassification::ExactEndTurn);
+        assert_eq!(observation.reason, FinalAnswerReason::NoFinalChunks);
+        assert!(observation.answer.is_none());
+        assert_eq!(observation.content_bytes, None);
+        assert_eq!(observation.content_hmac_sha256, None);
+    }
+
+    #[test]
+    fn shadow_classification_distinguishes_rejection_reasons() {
+        let mut empty = FinalAnswerCollector::default();
+        empty.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-1",
+            "content": {"type": "text", "text": "  \n"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        assert_eq!(
+            empty
+                .finish_classification(StopReasonClassification::ExactEndTurn)
+                .reason,
+            FinalAnswerReason::EmptyText
+        );
+
+        let mut malformed = FinalAnswerCollector::default();
+        malformed.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "missing id"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        assert_eq!(
+            malformed
+                .finish_classification(StopReasonClassification::ExactEndTurn)
+                .reason,
+            FinalAnswerReason::InvalidMessageId
+        );
+
+        let mut nonterminal = FinalAnswerCollector::default();
+        nonterminal.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-1",
+            "content": {"type": "text", "text": "partial"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        assert_eq!(
+            nonterminal
+                .finish_classification(StopReasonClassification::NonEndTurn)
+                .reason,
+            FinalAnswerReason::NonEndTurn
+        );
+
+        let mut noncanonical = FinalAnswerCollector::default();
+        assert_eq!(
+            noncanonical
+                .finish_classification(StopReasonClassification::NoncanonicalEndTurn)
+                .reason,
+            FinalAnswerReason::NoncanonicalEndTurn
+        );
+    }
+
+    #[test]
+    fn shadow_classification_distinguishes_byte_and_chunk_limits() {
+        let mut bytes = FinalAnswerCollector {
+            observed_bytes: MAX_FINAL_ANSWER_BYTES,
+            ..Default::default()
+        };
+        bytes.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-1",
+            "content": {"type": "text", "text": "x"},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        assert_eq!(
+            bytes
+                .finish_classification(StopReasonClassification::ExactEndTurn)
+                .reason,
+            FinalAnswerReason::ByteLimitExceeded
+        );
+
+        let mut chunks = FinalAnswerCollector {
+            observed_chunks: MAX_FINAL_ANSWER_CHUNKS,
+            ..Default::default()
+        };
+        chunks.observe(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "message-1",
+            "content": {"type": "text", "text": ""},
+            "_meta": {"codex": {"phase": "final_answer"}}
+        }));
+        assert_eq!(
+            chunks
+                .finish_classification(StopReasonClassification::ExactEndTurn)
+                .reason,
+            FinalAnswerReason::ChunkLimitExceeded
+        );
+    }
+
+    #[test]
+    fn shadow_digest_is_keyed_and_stable_for_one_install_key() {
+        let key = [7_u8; 32];
+        let digest = telemetry_content_hmac(&key, b"yes");
+
+        assert_eq!(digest, telemetry_content_hmac(&key, b"yes"));
+        assert_ne!(digest, telemetry_content_hmac(&[8_u8; 32], b"yes"));
+        assert_ne!(digest, hex::encode(Sha256::digest(b"yes")));
+    }
+
+    #[test]
+    fn telemetry_hmac_key_is_persisted_and_reused() {
+        let dir = std::env::temp_dir().join(format!("buzz-acp-hmac-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("telemetry-hmac.key");
+
+        let first = load_or_create_telemetry_hmac_key(&path).expect("create telemetry key");
+        let second = load_or_create_telemetry_hmac_key(&path).expect("reload telemetry key");
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&path).expect("read telemetry key"), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("stat telemetry key")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(dir).expect("remove telemetry key fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn telemetry_hmac_key_repairs_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("buzz-acp-hmac-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create telemetry key fixture");
+        let path = dir.join("telemetry-hmac.key");
+        let expected = [23_u8; 32];
+        std::fs::write(&path, expected).expect("write permissive telemetry key");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make telemetry key permissive");
+
+        let loaded = load_or_create_telemetry_hmac_key(&path).expect("load telemetry key");
+
+        assert_eq!(loaded, expected);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("stat telemetry key")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(dir).expect("remove telemetry key fixture");
+    }
+
+    #[tokio::test]
+    async fn prompt_error_emits_internal_error_classification() {
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_script("read _; sleep 1").await;
+        client.set_observer(Some(observer.clone()), 0);
+
+        let error = client
+            .session_prompt_turn_with_idle_timeout(
+                "session-1",
+                "prompt",
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect_err("silent agent never returns a JSON-RPC response");
+        assert!(matches!(error, AcpError::IdleTimeout(_)));
+
+        let classifications: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "final_answer_classification")
+            .collect();
+        assert_eq!(classifications.len(), 1);
+        assert_eq!(classifications[0].payload["reason"], "internal_error");
+        assert_eq!(classifications[0].payload["exactEndTurn"], false);
+        assert_eq!(
+            classifications[0].payload["contentBytes"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            classifications[0].payload["contentHmacSha256"],
+            serde_json::Value::Null
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prompt_write_error_emits_internal_error_classification() {
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_script("sleep 10").await;
+        client.set_observer(Some(observer.clone()), 0);
+        client.child.kill().await.expect("kill test agent");
+        client.child.wait().await.expect("reap test agent");
+
+        let error = client
+            .session_prompt_turn_with_idle_timeout(
+                "session-1",
+                "prompt",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect_err("closed agent stdin must reject the prompt write");
+        assert!(matches!(error, AcpError::Io(_)));
+
+        let classifications: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "final_answer_classification")
+            .collect();
+        assert_eq!(classifications.len(), 1);
+        assert_eq!(classifications[0].payload["reason"], "internal_error");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_emits_one_non_end_turn_classification() {
+        let script = "read _; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"stopReason\":\"cancelled\"}}'; sleep 1";
+        let mut client = spawn_script(script).await;
+        let observer = ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        client.last_prompt_id = Some(99);
+
+        let reason = client
+            .cancel_with_cleanup_grace("session-1", std::time::Duration::from_secs(1))
+            .await
+            .expect("cancel response must drain");
+        assert_eq!(reason, StopReason::Cancelled);
+
+        let classifications: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "final_answer_classification")
+            .collect();
+        assert_eq!(classifications.len(), 1);
+        assert_eq!(classifications[0].payload["reason"], "non_end_turn");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_with_unknown_stop_reason_emits_internal_error_classification() {
+        let script = "read _; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"stopReason\":\"future_reason\"}}'; sleep 1";
+        let mut client = spawn_script(script).await;
+        let observer = ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        client.last_prompt_id = Some(99);
+
+        let error = client
+            .cancel_with_cleanup_grace("session-1", std::time::Duration::from_secs(1))
+            .await
+            .expect_err("unknown cancellation stop reason must fail closed");
+        assert!(matches!(error, AcpError::Protocol(_)));
+
+        let classifications: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "final_answer_classification")
+            .collect();
+        assert_eq!(classifications.len(), 1);
+        assert_eq!(classifications[0].payload["reason"], "internal_error");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_stop_reason_emits_internal_error_classification() {
+        let script = "read _; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"stopReason\":\"future_reason\"}}'; sleep 1";
+        let mut client = spawn_script(script).await;
+        let observer = ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+
+        let error = client
+            .session_prompt_turn_with_idle_timeout(
+                "session-1",
+                "prompt",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect_err("unknown stop reason must fail closed");
+        assert!(matches!(error, AcpError::Protocol(_)));
+
+        let classifications: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "final_answer_classification")
+            .collect();
+        assert_eq!(classifications.len(), 1);
+        assert_eq!(classifications[0].payload["reason"], "internal_error");
+        client.shutdown().await;
+    }
+
+    #[test]
     fn final_answer_before_last_tool_boundary_is_not_deliverable() {
         let mut collector = FinalAnswerCollector::default();
         collector.observe(&serde_json::json!({
@@ -5194,7 +5786,7 @@ mod tests {
                 }));
             }
         }
-        assert!(bytes.limit_exceeded);
+        assert!(bytes.limit_reason.is_some());
         assert_eq!(bytes.finish(true), None);
 
         let mut chunks = FinalAnswerCollector::default();
@@ -5213,7 +5805,7 @@ mod tests {
                 }));
             }
         }
-        assert!(chunks.limit_exceeded);
+        assert!(chunks.limit_reason.is_some());
         assert_eq!(chunks.finish(true), None);
     }
 
@@ -5242,7 +5834,7 @@ mod tests {
         }
         chunks.observe(&valid_tool);
         chunks.observe(&valid_answer);
-        assert!(chunks.limit_exceeded);
+        assert!(chunks.limit_reason.is_some());
         assert_eq!(chunks.finish(true), None);
 
         let mut bytes = FinalAnswerCollector::default();
@@ -5257,7 +5849,7 @@ mod tests {
         }));
         bytes.observe(&valid_tool);
         bytes.observe(&valid_answer);
-        assert!(bytes.limit_exceeded);
+        assert!(bytes.limit_reason.is_some());
         assert_eq!(bytes.finish(true), None);
     }
 
@@ -5289,7 +5881,7 @@ mod tests {
             "toolCallId": "tool-1"
         }));
         limited.observe(&valid_answer);
-        assert!(limited.limit_exceeded);
+        assert!(limited.limit_reason.is_some());
         assert_eq!(limited.finish(true), None);
     }
 
@@ -5319,6 +5911,8 @@ mod tests {
                 "read _; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"session-1\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"message-1\",\"content\":{{\"type\":\"text\",\"text\":\"hello\"}},\"_meta\":{{\"codex\":{{\"phase\":\"final_answer\"}}}}}}}}}}' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"stopReason\":\"{raw_stop_reason}\"}}}}'; sleep 1"
             );
             let mut client = spawn_script(&script).await;
+            let observer = ObserverHandle::in_process();
+            client.set_observer(Some(observer.clone()), 0);
             let result = client
                 .session_prompt_turn_with_idle_timeout(
                     "session-1",
@@ -5330,6 +5924,12 @@ mod tests {
                 .expect("case-insensitive legacy stop parsing remains supported");
             assert_eq!(result.stop_reason, StopReason::EndTurn);
             assert_eq!(result.final_answer, None);
+            let classification = observer
+                .snapshot()
+                .into_iter()
+                .find(|event| event.kind == "final_answer_classification")
+                .expect("classification event");
+            assert_eq!(classification.payload["reason"], "noncanonical_end_turn");
         }
     }
 

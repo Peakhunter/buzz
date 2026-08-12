@@ -43,6 +43,8 @@ use pool::{
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
+#[cfg(test)]
+use sha2::Digest;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -65,6 +67,81 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
 /// human interaction, so it must not share the short probe timeout.
 const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Clone, Copy)]
+struct LegacyObservationCandidate<'a> {
+    turn_id: &'a str,
+    channel_id: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyAttributionConfidence {
+    ObservedInFlightChannel,
+    AmbiguousInFlightChannel,
+}
+
+struct ObservedLegacyPublication {
+    turn_id: Option<String>,
+    event_id: String,
+    content_bytes: usize,
+    content_hmac_sha256: String,
+    confidence: LegacyAttributionConfidence,
+    ambiguous: bool,
+    safety_barrier_evidence: bool,
+}
+
+impl ObservedLegacyPublication {
+    fn telemetry(&self) -> serde_json::Value {
+        serde_json::json!({
+            "eventId": self.event_id,
+            "contentBytes": self.content_bytes,
+            "contentHmacSha256": self.content_hmac_sha256,
+            "confidence": self.confidence,
+            "ambiguous": self.ambiguous,
+            "safetyBarrierEvidence": self.safety_barrier_evidence,
+        })
+    }
+}
+
+/// Best-effort A1 measurement only. This is not the atomic exact correlation
+/// required by the host-delivery duplicate barrier and can never satisfy it.
+/// Publication is observed only while a turn remains in `task_map`; a late or
+/// missing relay echo is indistinguishable from a silent legacy publication
+/// failure. A1 reports must therefore treat the unmatched rate as timing-
+/// confounded coverage, not as a legacy publication bug rate.
+fn observe_legacy_publication<'a>(
+    channel_id: Uuid,
+    event: &nostr::Event,
+    agent_pubkey_hex: &str,
+    telemetry_hmac_key: &[u8; 32],
+    candidates: impl IntoIterator<Item = LegacyObservationCandidate<'a>>,
+) -> Option<ObservedLegacyPublication> {
+    if event.pubkey.to_hex() != agent_pubkey_hex {
+        return None;
+    }
+    let mut matching = candidates
+        .into_iter()
+        .filter(|candidate| candidate.channel_id == Some(channel_id));
+    let candidate = matching.next()?;
+    let ambiguous = matching.next().is_some();
+    Some(ObservedLegacyPublication {
+        turn_id: (!ambiguous).then(|| candidate.turn_id.to_owned()),
+        event_id: event.id.to_hex(),
+        content_bytes: event.content.len(),
+        content_hmac_sha256: acp::telemetry_content_hmac(
+            telemetry_hmac_key,
+            event.content.as_bytes(),
+        ),
+        confidence: if ambiguous {
+            LegacyAttributionConfidence::AmbiguousInFlightChannel
+        } else {
+            LegacyAttributionConfidence::ObservedInFlightChannel
+        },
+        ambiguous,
+        safety_barrier_evidence: false,
+    })
+}
 
 /// Publish a kind:20001 presence update event via the WebSocket connection.
 ///
@@ -1578,6 +1655,21 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
+    let telemetry_hmac_key = if config.relay_observer {
+        let telemetry_hmac_key_path = dirs::data_local_dir()
+            .ok_or_else(|| anyhow::anyhow!("local application data directory is unavailable"))?
+            .join("buzz-acp")
+            .join("telemetry-hmac.key");
+        let telemetry_hmac_key = acp::load_or_create_telemetry_hmac_key(&telemetry_hmac_key_path)
+            .map_err(|error| {
+            anyhow::anyhow!("failed to initialize telemetry HMAC key: {error}")
+        })?;
+        acp::initialize_telemetry_hmac_key(telemetry_hmac_key);
+        Some(telemetry_hmac_key)
+    } else {
+        None
+    };
+
     let observer = config
         .relay_observer
         .then(observer::ObserverHandle::in_process);
@@ -2327,6 +2419,36 @@ async fn tokio_main() -> Result<()> {
                                     }
                                 }
                                 continue;
+                            }
+
+                            if kind_u32 == KIND_STREAM_MESSAGE
+                                && buzz_event.event.pubkey.to_hex() == pubkey_hex
+                            {
+                                if let Some(telemetry_hmac_key) = telemetry_hmac_key.as_ref() {
+                                    if let Some(observed) = observe_legacy_publication(
+                                        buzz_event.channel_id,
+                                        &buzz_event.event,
+                                        &pubkey_hex,
+                                        telemetry_hmac_key,
+                                        pool.task_map().values().map(|meta| LegacyObservationCandidate {
+                                            turn_id: &meta.turn_id,
+                                            channel_id: meta.channel_id,
+                                        }),
+                                    ) {
+                                        if let Some(observer) = observer.as_ref() {
+                                            observer.emit(
+                                                "observed_legacy_publication_attribution",
+                                                None,
+                                                &observer::context_for(
+                                                    Some(buzz_event.channel_id),
+                                                    None,
+                                                    observed.turn_id.clone(),
+                                                ),
+                                                observed.telemetry(),
+                                            );
+                                        }
+                                    }
+                                }
                             }
 
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
@@ -6532,6 +6654,92 @@ mod error_outcome_emission_tests {
             })),
             "buzz-agent"
         );
+    }
+
+    #[test]
+    fn observed_legacy_publication_attribution_is_metadata_only_and_non_authoritative() {
+        let channel_id = Uuid::new_v4();
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "private published reply")
+            .sign_with_keys(&keys)
+            .expect("signed event");
+
+        let telemetry_key = [7_u8; 32];
+        let observed = observe_legacy_publication(
+            channel_id,
+            &event,
+            &keys.public_key().to_hex(),
+            &telemetry_key,
+            [LegacyObservationCandidate {
+                turn_id: "turn-1",
+                channel_id: Some(channel_id),
+            }],
+        )
+        .expect("single in-flight channel turn is attributable");
+
+        assert_eq!(observed.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(observed.event_id, event.id.to_hex());
+        assert_eq!(observed.content_bytes, 23);
+        assert_eq!(
+            observed.content_hmac_sha256,
+            acp::telemetry_content_hmac(&telemetry_key, event.content.as_bytes())
+        );
+        assert_eq!(
+            observed.confidence,
+            LegacyAttributionConfidence::ObservedInFlightChannel
+        );
+        assert!(!observed.ambiguous);
+        assert!(!observed.safety_barrier_evidence);
+        let serialized = serde_json::to_string(&observed.telemetry()).expect("telemetry JSON");
+        assert!(!serialized.contains("private published reply"));
+        assert!(!serialized.contains(&hex::encode(sha2::Sha256::digest(event.content.as_bytes()))));
+    }
+
+    #[test]
+    fn observed_legacy_publication_attribution_rejects_other_authors_and_ambiguity() {
+        let channel_id = Uuid::new_v4();
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "reply")
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let other = Keys::generate().public_key().to_hex();
+
+        assert!(observe_legacy_publication(
+            channel_id,
+            &event,
+            &other,
+            &[7_u8; 32],
+            [LegacyObservationCandidate {
+                turn_id: "turn-1",
+                channel_id: Some(channel_id),
+            }],
+        )
+        .is_none());
+
+        let ambiguous = observe_legacy_publication(
+            channel_id,
+            &event,
+            &keys.public_key().to_hex(),
+            &[7_u8; 32],
+            [
+                LegacyObservationCandidate {
+                    turn_id: "turn-1",
+                    channel_id: Some(channel_id),
+                },
+                LegacyObservationCandidate {
+                    turn_id: "turn-2",
+                    channel_id: Some(channel_id),
+                },
+            ],
+        )
+        .expect("ambiguous observation remains observable");
+        assert_eq!(ambiguous.turn_id, None);
+        assert_eq!(
+            ambiguous.confidence,
+            LegacyAttributionConfidence::AmbiguousInFlightChannel
+        );
+        assert!(ambiguous.ambiguous);
+        assert!(!ambiguous.safety_barrier_evidence);
     }
 
     /// Spawn a real but inert agent subprocess (`cat`) so the error paths have
