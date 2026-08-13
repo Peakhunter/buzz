@@ -76,8 +76,6 @@ trap restore_versions EXIT
 
 export BUZZ_BUILD_CANDIDATE_ID=peakhunter
 export BUZZ_RELAY_URL="${BUZZ_RELAY_URL:-ws://buzz.peakhunter.com:3000}"
-MESH_LLM_NATIVE_RUNTIME_CACHE_DIR="$(./scripts/ensure-mesh-native-runtime.sh)"
-export MESH_LLM_NATIVE_RUNTIME_CACHE_DIR
 
 cargo build --release \
   -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes \
