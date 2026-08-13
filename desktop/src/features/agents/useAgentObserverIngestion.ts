@@ -172,6 +172,15 @@ export function useAgentObserverIngestion() {
     relayAgentPubkeys,
   ]);
 
-  useManagedAgentObserverBridge(ingestionAgents);
+  const resolvedProfileCandidatePubkeys = React.useMemo(
+    () => (profilesQuery.dataUpdatedAt > 0 ? profileCandidatePubkeys : []),
+    [profileCandidatePubkeys, profilesQuery.dataUpdatedAt],
+  );
+
+  useManagedAgentObserverBridge(
+    ingestionAgents,
+    profileCandidatePubkeys,
+    resolvedProfileCandidatePubkeys,
+  );
   useActiveAgentTurnsBridge(ingestionAgents);
 }
