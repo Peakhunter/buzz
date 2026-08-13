@@ -995,24 +995,15 @@ pub(crate) fn is_npm_global_install(cmd: &str) -> bool {
 /// background threads to prevent pipe-buffer deadlock. On timeout the child is
 /// killed and `Unknown` is returned; no orphaned threads or processes are left
 /// behind. Returns `Unknown` on timeout.
-fn probe_auth_status(
-    binary_path: &Path,
-    probe_args: &[&str],
-    runtime_plan: Option<&super::runtime_plan::RuntimeExecutionPlan>,
-) -> AuthStatus {
+fn probe_auth_status(binary_path: &Path, probe_args: &[&str]) -> AuthStatus {
     use crate::managed_agents::readiness::cli_probe;
 
-    let augmented_path = runtime_plan
-        .and_then(|plan| plan.generated_environment("PATH").map(str::to_string))
-        .or_else(cli_probe::augmented_path);
+    let augmented_path = cli_probe::augmented_path();
 
     let mut command = std::process::Command::new(binary_path);
     command.args(&probe_args[1..]);
     if let Some(ref path) = augmented_path {
         command.env("PATH", path);
-    }
-    if let Some(plan) = runtime_plan {
-        plan.apply_environment(&mut command);
     }
     command
         .stdin(std::process::Stdio::null())
@@ -1142,16 +1133,153 @@ pub(crate) fn classify_runtime(
     }
 }
 
-mod codex_version;
+/// The oldest `codex-acp` version supported by Buzz managed agents.
+///
+/// Older 1.x adapters are detected successfully, but can still bundle a Codex runtime
+/// that does not reliably give `buzz` CLI subprocesses outbound relay access.
+///
+/// Bump policy: raise this only when a newer adapter fixes a defect that breaks managed
+/// agents, and only to a version already published on npm — every user below the floor is
+/// offered a reinstall on their next discovery pass.
+pub(crate) const MIN_CODEX_ACP_VERSION: (u64, u64, u64) = (1, 1, 7);
 
+/// Probe the full version of a `codex-acp` binary by running `--version`.
+///
+/// The 1.x adapter (`@agentclientprotocol/codex-acp`) outputs
+/// `@agentclientprotocol/codex-acp <major>.<minor>.<patch>` on stdout and exits 0.
+/// The old 0.16.x adapter (`@zed-industries/codex-acp`) is a Rust binary that does
+/// not recognise `--version` and exits non-zero.
+///
+/// Returns the `(major, minor, patch)` triple on success, `None` on any failure
+/// (non-zero exit, unparseable output, timeout, or missing binary).
+///
+/// The parse is deliberately strict: exactly three numeric dot-separated components.
+/// Partial versions (`1.2`) and prerelease tags (`1.2.0-rc1`) return `None` and so
+/// classify as [`AcpAvailabilityStatus::AdapterOutdated`] — failing closed offers a
+/// reinstall rather than running an adapter whose version cannot be compared.
+///
+/// The probe is bounded by a 5-second deadline. The child is polled with
+/// [`std::process::Child::try_wait`] (the repo's standard deadline pattern) and
+/// killed if it does not exit in time.
+///
+/// Stdout is redirected to a temporary file rather than a pipe, so forked
+/// descendants cannot hold EOF open. Reads from a regular file return EOF at its
+/// current write position regardless of inherited file descriptors, cross-platform.
+pub(crate) fn probe_codex_acp_version(binary_path: &Path) -> Option<(u64, u64, u64)> {
+    probe_codex_acp_version_with_path(
+        binary_path,
+        crate::managed_agents::readiness::cli_probe::augmented_path().as_deref(),
+    )
+}
+pub(crate) fn probe_codex_acp_version_with_path(
+    binary_path: &Path,
+    augmented_path: Option<&str>,
+) -> Option<(u64, u64, u64)> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::time::{Duration, Instant};
+    const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    // A regular file returns EOF at its current size even when a descendant
+    // inherits its descriptor, bounding the post-exit read cross-platform.
+    let mut tmp = tempfile::tempfile().ok()?;
+
+    let mut command = Command::new(binary_path);
+    command.arg("--version");
+    if let Some(path) = augmented_path {
+        command.env("PATH", path);
+    }
+    crate::util::configure_no_window(&mut command);
+    let mut child = command
+        .stdout(tmp.try_clone().ok()?)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Poll until the deadline rather than blocking on stdout EOF.
+    let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+
+    if !exit_status.success() {
+        return None;
+    }
+
+    // Read at most 4 KiB from the regular file without blocking.
+    tmp.seek(SeekFrom::Start(0)).ok()?;
+    let mut buf = Vec::with_capacity(128);
+    let _ = (&mut tmp as &mut dyn std::io::Read)
+        .take(4096)
+        .read_to_end(&mut buf);
+
+    let stdout = String::from_utf8_lossy(&buf);
+    // Output format: "<package-name> <major>.<minor>.<patch>"
+    let version_str = stdout.split_whitespace().last()?;
+    let mut components = version_str.split('.');
+    let major = components.next()?.parse::<u64>().ok()?;
+    let minor = components.next()?.parse::<u64>().ok()?;
+    let patch = components.next()?.parse::<u64>().ok()?;
+    if components.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Classifies a resolved codex-acp binary path as [`AcpAvailabilityStatus::Available`]
+/// or [`AcpAvailabilityStatus::AdapterOutdated`].
+///
+/// The 0.16.x adapter (`@zed-industries/codex-acp`) does not recognise `--version`
+/// and exits non-zero — that probe failure yields `AdapterOutdated`. An adapter is
+/// available only when its version is at least [`MIN_CODEX_ACP_VERSION`].
+///
+/// Used by `discover_acp_runtimes`, `cli_login_requirements`, and
+/// `install_acp_runtime_blocking` so the version-gate logic is not duplicated.
+pub(crate) fn codex_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
+    match probe_codex_acp_version(path) {
+        Some(version) if version >= MIN_CODEX_ACP_VERSION => AcpAvailabilityStatus::Available,
+        _ => AcpAvailabilityStatus::AdapterOutdated,
+    }
+}
+
+/// Returns `true` when the codex-acp binary at `path` is below
+/// [`MIN_CODEX_ACP_VERSION`] or cannot be probed using `augmented_path`. Thin wrapper
+/// around [`codex_adapter_is_outdated_with_path`].
 #[cfg(test)]
-pub(crate) use codex_version::codex_adapter_is_outdated;
-pub(crate) use codex_version::{
-    codex_adapter_availability, codex_adapter_availability_with_plan,
-    codex_adapter_is_outdated_with_path, probe_codex_acp_version,
-    probe_codex_acp_version_with_path, MIN_CODEX_ACP_VERSION,
-};
+pub(crate) fn codex_adapter_is_outdated(path: &Path) -> bool {
+    codex_adapter_is_outdated_with_path(
+        path,
+        crate::managed_agents::readiness::cli_probe::augmented_path().as_deref(),
+    )
+}
 
+/// Returns `true` when the codex-acp binary at `path` is below
+/// [`MIN_CODEX_ACP_VERSION`] or cannot be probed with the supplied PATH.
+pub(crate) fn codex_adapter_is_outdated_with_path(
+    path: &Path,
+    augmented_path: Option<&str>,
+) -> bool {
+    !matches!(
+        probe_codex_acp_version_with_path(path, augmented_path),
+        Some(version) if version >= MIN_CODEX_ACP_VERSION
+    )
+}
+
+/// Intermediate struct built before the (potentially slow) auth probe phase.
 struct PartialEntry {
     runtime: &'static KnownAcpRuntime,
     entry: AcpRuntimeCatalogEntry,
@@ -1170,35 +1298,15 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime) -> PartialEntr
     let (mut availability, command, binary_path) =
         classify_runtime(adapter_result, runtime.underlying_cli, underlying_cli_found);
 
-    let runtime_plan =
-        command.as_deref().and_then(
-            |cmd| match super::runtime_plan::resolve_runtime_execution_plan(cmd) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    tracing::warn!(runtime = runtime.id, %error, "runtime plan resolution failed");
-                    None
-                }
-            },
-        );
-
-    // For codex-acp, version probing is execution and therefore consumes the
-    // same verified plan and sanitized environment as every later operation.
+    // For codex-acp: when the adapter resolves as Available, probe its full
+    // version. An adapter below MIN_CODEX_ACP_VERSION is treated as outdated.
     if runtime.id == "codex"
         && availability == AcpAvailabilityStatus::Available
         && command.as_deref() == Some("codex-acp")
     {
-        availability = if cfg!(windows) {
-            binary_path
-                .as_deref()
-                .map(Path::new)
-                .map(codex_adapter_availability)
-                .unwrap_or(AcpAvailabilityStatus::AdapterOutdated)
-        } else {
-            runtime_plan
-                .as_ref()
-                .map(codex_adapter_availability_with_plan)
-                .unwrap_or(AcpAvailabilityStatus::AdapterOutdated)
-        };
+        if let Some(path_str) = &binary_path {
+            availability = codex_adapter_availability(&PathBuf::from(path_str));
+        }
     }
 
     // Warm the adapter-availability cache for the badge fallback.
@@ -1267,10 +1375,6 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime) -> PartialEntr
             availability,
             command,
             binary_path,
-            runtime_plan_id: runtime_plan.as_ref().map(|plan| plan.id.clone()),
-            runtime_plan_source: runtime_plan
-                .as_ref()
-                .map(|plan| plan.source_label().to_string()),
             default_args,
             mcp_command: runtime.mcp_command.map(str::to_string),
             model_env_var: runtime.model_env_var.map(str::to_string),
@@ -1341,31 +1445,13 @@ pub fn discover_acp_runtimes_from(
                 return None;
             }
             let probe_args = partial.runtime.auth_probe_args?;
-            // Codex consumes the content-identified provider component and
-            // plan-owned PATH. Other runtime families retain their legacy
-            // discovery path until they gain a complete execution plan.
-            let runtime_command = partial.runtime.commands.first().copied()?;
-            let plan = match super::runtime_plan::resolve_runtime_execution_plan(runtime_command) {
-                Ok(plan) => plan,
-                Err(_) => return None,
-            };
-            if partial.runtime.id == "codex" && !cfg!(windows) && plan.is_none() {
-                return None;
-            }
-            let binary_path = if let Some(plan) = plan.as_ref() {
-                plan.provider_cli_path()?.to_path_buf()
-            } else {
-                let provider_command = partial.runtime.underlying_cli?;
-                resolve_command(provider_command)?
-            };
+            // Need the resolved binary path for the CLI (e.g. the actual `claude` binary).
+            let binary_path = resolve_command(probe_args[0])?;
             let probe_args_owned: Vec<String> = probe_args.iter().map(|s| s.to_string()).collect();
 
             let handle = std::thread::spawn(move || {
-                if plan.as_ref().is_some_and(|plan| plan.verify().is_err()) {
-                    return AuthStatus::Unknown;
-                }
                 let refs: Vec<&str> = probe_args_owned.iter().map(String::as_str).collect();
-                probe_auth_status(&binary_path, &refs, plan.as_ref())
+                probe_auth_status(&binary_path, &refs)
             });
             Some((idx, handle))
         })
@@ -1448,8 +1534,6 @@ pub fn discover_acp_runtimes_from(
                 availability,
                 command,
                 binary_path,
-                runtime_plan_id: None,
-                runtime_plan_source: None,
                 default_args,
                 // Custom harnesses are plain ACP — no MCP sidecar, no env-var
                 // model switching, no thinking knobs.

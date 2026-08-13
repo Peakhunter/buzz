@@ -67,16 +67,6 @@ const NEST_DIR_PROD: &str = ".buzz";
 /// `.repos-dir` dotfile and `REPOS` symlink.
 const NEST_DIR_DEV: &str = ".buzz-dev";
 
-fn configured_nest_suffix(is_dev: bool) -> String {
-    if let Some(candidate_id) = option_env!("BUZZ_DESKTOP_BUILD_CANDIDATE_ID") {
-        format!(".buzz-candidate-{candidate_id}")
-    } else if is_dev {
-        NEST_DIR_DEV.to_string()
-    } else {
-        NEST_DIR_PROD.to_string()
-    }
-}
-
 /// Process-lifetime nest directory. Initialized once at startup via
 /// [`init_nest_dir`] before any call to [`nest_dir`].
 ///
@@ -96,7 +86,7 @@ static NEST_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new
 /// when the Tauri app-data directory name starts with `"xyz.block.buzz.app.dev"`.
 /// Pass `false` for production (signed DMG) builds.
 pub fn init_nest_dir(is_dev: bool) {
-    let suffix = configured_nest_suffix(is_dev);
+    let suffix = if is_dev { NEST_DIR_DEV } else { NEST_DIR_PROD };
     let path = dirs::home_dir().map(|h| h.join(suffix));
     // set() is a no-op when already initialized, which is correct: only the
     // first call (at boot, before any filesystem work) should win.
@@ -112,7 +102,7 @@ pub fn nest_dir() -> Option<PathBuf> {
     match NEST_DIR.get() {
         Some(path) => path.clone(),
         // Not yet initialized — fall back to prod path. Covers test code.
-        None => dirs::home_dir().map(|h| h.join(configured_nest_suffix(false))),
+        None => dirs::home_dir().map(|h| h.join(NEST_DIR_PROD)),
     }
 }
 
