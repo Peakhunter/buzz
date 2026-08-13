@@ -6,7 +6,7 @@ PRODUCT_NAME="Buzz Peakhunter"
 CANDIDATE_ID="peakhunter"
 BUNDLE_ID="xyz.block.buzz.app.dev.peakhunter"
 URL_SCHEME="buzz-peakhunter"
-KEYRING_SERVICE="buzz-desktop-candidate.peakhunter"
+KEYRING_SERVICE="buzz-desktop-candidate.$CANDIDATE_ID"
 CONFIG="src-tauri/tauri.peakhunter.conf.json"
 
 if [[ "${1:-}" == "--print-contract" ]]; then
@@ -63,6 +63,7 @@ VERSION_PATHS=(
   desktop/src-tauri/Cargo.toml
   desktop/src-tauri/Cargo.lock
 )
+VERSION_PATHS_JSON="$(printf '%s\n' "${VERSION_PATHS[@]}" | python3 -c 'import json, sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin]))')"
 restore_versions() {
   git restore --source=HEAD -- "${VERSION_PATHS[@]}" || true
   if [[ "$BUILD_COMPLETE" != true ]]; then
@@ -136,6 +137,7 @@ NESTED_SIGNED_COUNT="$NESTED_SIGNED_COUNT" NOTARIZATION="$NOTARIZATION" \
 PRODUCT_NAME="$PRODUCT_NAME" BUNDLE_ID="$BUNDLE_ID" URL_SCHEME="$URL_SCHEME" \
 CANDIDATE_ID="$CANDIDATE_ID" KEYRING_SERVICE="$KEYRING_SERVICE" \
 ARCHITECTURE="$ARCHITECTURE" \
+VERSION_PATHS_JSON="$VERSION_PATHS_JSON" \
 python3 - <<'PY'
 import json
 import os
@@ -146,12 +148,7 @@ manifest = {
     "schema_version": 1,
     "source_sha": os.environ["SOURCE_SHA"],
     "source_tree_at_start": "clean",
-    "version_files_restamped": [
-        "desktop/package.json",
-        "desktop/src-tauri/tauri.conf.json",
-        "desktop/src-tauri/Cargo.toml",
-        "desktop/src-tauri/Cargo.lock",
-    ],
+    "version_files_restamped": json.loads(os.environ["VERSION_PATHS_JSON"]),
     "product_name": os.environ["PRODUCT_NAME"],
     "bundle_id": os.environ["BUNDLE_ID"],
     "url_scheme": os.environ["URL_SCHEME"],

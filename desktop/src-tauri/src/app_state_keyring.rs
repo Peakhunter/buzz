@@ -14,6 +14,9 @@ pub(crate) fn keyring_service() -> &'static str {
     // Candidate builds get their own keyring service so an installed test build
     // never reads or writes the released Buzz app's stored identity. Set at
     // compile time by build.rs from BUZZ_BUILD_CANDIDATE_ID.
+    // Candidate precedence over debug is load-bearing: candidate packages are
+    // release builds today, but must stay isolated even if a debug candidate is
+    // compiled for diagnostics later.
     if let Some(candidate_id) = option_env!("BUZZ_DESKTOP_BUILD_CANDIDATE_ID") {
         static CANDIDATE_SERVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         CANDIDATE_SERVICE

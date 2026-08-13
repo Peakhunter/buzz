@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "build-peakhunter-candidate.sh"
 CONFIG = ROOT / "desktop" / "src-tauri" / "tauri.peakhunter.conf.json"
 PLIST = ROOT / "desktop" / "src-tauri" / "Info.peakhunter.plist"
+KEYRING_SOURCE = ROOT / "desktop" / "src-tauri" / "src" / "app_state_keyring.rs"
 
 
 def require(text: str, needle: str) -> None:
@@ -46,6 +47,9 @@ def main() -> None:
     }
 
     script = SCRIPT.read_text(encoding="utf-8")
+    keyring_source = KEYRING_SOURCE.read_text(encoding="utf-8")
+    require(keyring_source, 'format!("buzz-desktop-candidate.{candidate_id}")')
+    require(script, 'KEYRING_SERVICE="buzz-desktop-candidate.$CANDIDATE_ID"')
     require(script, 'OUTPUT_ROOT="$REPO_ROOT/target/peakhunter-candidate/$SOURCE_SHA"')
     require(script, 'git status --porcelain --untracked-files=all')
     require(script, "':!desktop/src-tauri/target'")
@@ -65,6 +69,8 @@ def main() -> None:
     require(script, "codesign --verify --deep --strict")
     require(script, 'PRODUCT_NAME="$PRODUCT_NAME" BUNDLE_ID="$BUNDLE_ID"')
     require(script, 'KEYRING_SERVICE="$KEYRING_SERVICE"')
+    require(script, 'VERSION_PATHS_JSON="$VERSION_PATHS_JSON"')
+    require(script, 'json.loads(os.environ["VERSION_PATHS_JSON"])')
     require(script, '"version_files_restamped"')
     if '"source_dirty": False' in script:
         raise AssertionError("manifest must not hardcode source_dirty")
