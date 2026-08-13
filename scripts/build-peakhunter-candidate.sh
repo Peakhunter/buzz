@@ -20,10 +20,13 @@ if [[ $# -ne 0 ]]; then
 fi
 
 cd "$REPO_ROOT"
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "candidate build requires a clean tracked worktree" >&2
+WORKTREE_STATUS="$(git status --porcelain --untracked-files=all -- ':!target' ':!desktop/src-tauri/target')"
+if [[ -n "$WORKTREE_STATUS" ]]; then
+  echo "candidate build requires a clean worktree, including untracked files" >&2
+  printf '%s\n' "$WORKTREE_STATUS" >&2
   exit 1
 fi
+: "${BUZZ_RELAY_URL:?set BUZZ_RELAY_URL explicitly for the candidate build}"
 SOURCE_SHA="$(git rev-parse HEAD)"
 SHORT_SHA="${SOURCE_SHA:0:12}"
 VERSION="0.5.11-test.$SHORT_SHA"
@@ -39,7 +42,6 @@ if [[ -e "$OUTPUT_ROOT" ]]; then
   echo "refusing to overwrite existing immutable candidate: $OUTPUT_ROOT" >&2
   exit 1
 fi
-mkdir -p "$OUTPUT_ROOT"
 BUILD_COMPLETE=false
 
 SIGNING_IDENTITIES=()
@@ -68,14 +70,14 @@ restore_versions() {
   fi
 }
 trap restore_versions EXIT
+mkdir -p "$OUTPUT_ROOT"
 
 (
   cd desktop
   node scripts/set-version-from-tag.mjs "$VERSION"
 )
 
-export BUZZ_BUILD_CANDIDATE_ID=peakhunter
-export BUZZ_RELAY_URL="${BUZZ_RELAY_URL:-ws://buzz.peakhunter.com:3000}"
+export BUZZ_BUILD_CANDIDATE_ID="$CANDIDATE_ID"
 
 cargo build --release \
   -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes \
@@ -91,8 +93,14 @@ pnpm install --frozen-lockfile
 ditto "$UNSIGNED_APP" "$APP"
 
 while IFS= read -r -d '' nested; do
+  # These are standalone CLI sidecars. MeshLLM's downloaded native runtime is
+  # loaded in-process by the enclosing Tauri executable, which receives the
+  # library-validation entitlement below; no sidecar loads that runtime.
   codesign --force --sign "$SIGNING_IDENTITY" --options runtime --timestamp=none "$nested"
-done < <(find "$APP/Contents/MacOS" -type f -perm -111 -print0)
+done < <(find "$APP/Contents/MacOS" -depth -type f -perm -111 -print0)
+# Apple Development candidates deliberately use timestamp-free local signing.
+# This is not a Developer ID/notarization pipeline; distribution requires a
+# separate timestamped signing and notarization policy.
 codesign --force --sign "$SIGNING_IDENTITY" --options runtime --timestamp=none --entitlements "$ENTITLEMENTS" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
@@ -100,15 +108,19 @@ ACTUAL_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Conten
 ACTUAL_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APP/Contents/Info.plist")"
 ACTUAL_SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
 ACTUAL_BUILD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")"
-[[ "$ACTUAL_ID" == "$BUNDLE_ID" ]]
-[[ "$ACTUAL_NAME" == "$PRODUCT_NAME" ]]
-[[ "$ACTUAL_SHORT_VERSION" == "$VERSION" ]]
-[[ "$ACTUAL_BUILD_VERSION" == "$VERSION" ]]
+[[ "$ACTUAL_ID" == "$BUNDLE_ID" ]] || { echo "bundle identifier mismatch: expected $BUNDLE_ID, got $ACTUAL_ID" >&2; exit 1; }
+[[ "$ACTUAL_NAME" == "$PRODUCT_NAME" ]] || { echo "display name mismatch: expected $PRODUCT_NAME, got $ACTUAL_NAME" >&2; exit 1; }
+[[ "$ACTUAL_SHORT_VERSION" == "$VERSION" ]] || { echo "short version mismatch: expected $VERSION, got $ACTUAL_SHORT_VERSION" >&2; exit 1; }
+[[ "$ACTUAL_BUILD_VERSION" == "$VERSION" ]] || { echo "build version mismatch: expected $VERSION, got $ACTUAL_BUILD_VERSION" >&2; exit 1; }
 
 TEAM_ID="$(codesign -dvv "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
-[[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]
+[[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "invalid or missing signing Team ID: $TEAM_ID" >&2; exit 1; }
+SIGNATURE_FLAGS="$(codesign -dvv "$APP" 2>&1 | sed -n 's/^CodeDirectory .* flags=\([^ ]*\).*/\1/p')"
+[[ "$SIGNATURE_FLAGS" == *runtime* ]] || { echo "outer app signature is missing hardened-runtime flag: $SIGNATURE_FLAGS" >&2; exit 1; }
 EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
 EXECUTABLE="$APP/Contents/MacOS/$EXECUTABLE_NAME"
+ARCHITECTURE="$(lipo -archs "$EXECUTABLE")"
+[[ "$ARCHITECTURE" == "arm64" ]] || { echo "candidate architecture mismatch: expected arm64, got $ARCHITECTURE" >&2; exit 1; }
 EXECUTABLE_SHA256="$(shasum -a 256 "$EXECUTABLE" | cut -d' ' -f1)"
 ENTITLEMENTS_SHA256="$(shasum -a 256 "$ENTITLEMENTS" | cut -d' ' -f1)"
 NESTED_SIGNED_COUNT="$(find "$APP/Contents/MacOS" -type f -perm -111 | wc -l | tr -d ' ')"
@@ -121,6 +133,9 @@ SOURCE_SHA="$SOURCE_SHA" VERSION="$VERSION" OUTPUT_ROOT="$OUTPUT_ROOT" ZIP="$ZIP
 ZIP_SHA256="$ZIP_SHA256" EXECUTABLE_SHA256="$EXECUTABLE_SHA256" \
 ENTITLEMENTS_SHA256="$ENTITLEMENTS_SHA256" TEAM_ID="$TEAM_ID" \
 NESTED_SIGNED_COUNT="$NESTED_SIGNED_COUNT" NOTARIZATION="$NOTARIZATION" \
+PRODUCT_NAME="$PRODUCT_NAME" BUNDLE_ID="$BUNDLE_ID" URL_SCHEME="$URL_SCHEME" \
+CANDIDATE_ID="$CANDIDATE_ID" KEYRING_SERVICE="$KEYRING_SERVICE" \
+ARCHITECTURE="$ARCHITECTURE" \
 python3 - <<'PY'
 import json
 import os
@@ -130,31 +145,32 @@ root = Path(os.environ["OUTPUT_ROOT"])
 manifest = {
     "schema_version": 1,
     "source_sha": os.environ["SOURCE_SHA"],
-    "source_dirty": False,
-    "product_name": "Buzz Peakhunter",
-    "bundle_id": "xyz.block.buzz.app.dev.peakhunter",
-    "url_scheme": "buzz-peakhunter",
-    "candidate_id": "peakhunter",
-    "keyring_service": "buzz-desktop-candidate.peakhunter",
+    "source_tree_at_start": "clean",
+    "version_files_restamped": [
+        "desktop/package.json",
+        "desktop/src-tauri/tauri.conf.json",
+        "desktop/src-tauri/Cargo.toml",
+        "desktop/src-tauri/Cargo.lock",
+    ],
+    "product_name": os.environ["PRODUCT_NAME"],
+    "bundle_id": os.environ["BUNDLE_ID"],
+    "url_scheme": os.environ["URL_SCHEME"],
+    "candidate_id": os.environ["CANDIDATE_ID"],
+    "keyring_service": os.environ["KEYRING_SERVICE"],
     "version": os.environ["VERSION"],
-    "architecture": "arm64",
-    "app_path": str(root / "Buzz Peakhunter.app"),
+    "architecture": os.environ["ARCHITECTURE"],
+    "app_path": str(root / f'{os.environ["PRODUCT_NAME"]}.app'),
     "archive_path": os.environ["ZIP"],
     "archive_sha256": os.environ["ZIP_SHA256"],
     "executable_sha256": os.environ["EXECUTABLE_SHA256"],
     "signing": {
         "kind": "Apple Development",
         "team_id": os.environ["TEAM_ID"],
-        "hardened_runtime": True,
+        "hardened_runtime_verification": "passed",
         "nested_executable_count": int(os.environ["NESTED_SIGNED_COUNT"]),
-        "strict_verification": True,
+        "strict_verification": "passed",
         "entitlements_sha256": os.environ["ENTITLEMENTS_SHA256"],
         "notarization": os.environ["NOTARIZATION"],
-    },
-    "notification_verification": {
-        "command": "notification_permission_state",
-        "requests_authorization": False,
-        "result": "pending_disposable_launch",
     },
 }
 (root / "manifest.json").write_text(

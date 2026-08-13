@@ -6,6 +6,10 @@ fn dev_keyring_service(configured: Option<String>) -> String {
         .unwrap_or_else(|| "buzz-desktop-dev".to_string())
 }
 
+fn candidate_keyring_service(candidate_id: &str) -> String {
+    format!("buzz-desktop-candidate.{candidate_id}")
+}
+
 pub(crate) fn keyring_service() -> &'static str {
     // Candidate builds get their own keyring service so an installed test build
     // never reads or writes the released Buzz app's stored identity. Set at
@@ -13,7 +17,7 @@ pub(crate) fn keyring_service() -> &'static str {
     if let Some(candidate_id) = option_env!("BUZZ_DESKTOP_BUILD_CANDIDATE_ID") {
         static CANDIDATE_SERVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         CANDIDATE_SERVICE
-            .get_or_init(|| format!("buzz-desktop-candidate.{candidate_id}"))
+            .get_or_init(|| candidate_keyring_service(candidate_id))
             .as_str()
     } else if cfg!(debug_assertions) {
         static DEV_SERVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -35,7 +39,7 @@ pub(super) fn migration_marker_name(service: &str, default_name: &str) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::{dev_keyring_service, migration_marker_name};
+    use super::{candidate_keyring_service, dev_keyring_service, migration_marker_name};
 
     #[test]
     fn standalone_scope_must_remain_under_dev_service() {
@@ -70,10 +74,10 @@ mod tests {
         // A candidate build must not read or write the released app's stored
         // identity: its keyring service and its migration marker both have to
         // stay distinct from the plain "buzz-desktop" release pair.
-        let candidate = "buzz-desktop-candidate.test-release";
+        let candidate = candidate_keyring_service("test-release");
         assert_ne!(candidate, "buzz-desktop");
         assert_eq!(
-            migration_marker_name(candidate, "identity.migrated"),
+            migration_marker_name(&candidate, "identity.migrated"),
             "identity.buzz-desktop-candidate.test-release.migrated"
         );
     }
