@@ -1,0 +1,22 @@
+{
+  "productName": "Buzz Peakhunter",
+  "identifier": "xyz.block.buzz.app.dev.peakhunter",
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "infoPlist": "Info.peakhunter.plist",
+      "entitlements": "Entitlements.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": []
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["buzz-peakhunter"]
+      }
+    }
+  }
+}
