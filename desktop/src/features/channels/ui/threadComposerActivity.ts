@@ -1,3 +1,5 @@
+import { truncatePubkey } from "@/shared/lib/pubkey";
+
 type ActivityAgent = { pubkey: string; name: string };
 type ActivityProfile = { displayName?: string | null };
 
@@ -15,7 +17,7 @@ export function completeActivityAgentRoster(
     known.add(normalized);
     completed.push({
       pubkey,
-      name: profiles[normalized]?.displayName || `${pubkey.slice(0, 8)}…`,
+      name: profiles[normalized]?.displayName || truncatePubkey(pubkey),
     });
   }
 
