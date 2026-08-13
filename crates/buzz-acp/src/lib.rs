@@ -1468,6 +1468,33 @@ fn inactivity_expired(
     !bound.is_zero() && !turn_in_flight && now.duration_since(last_activity) >= bound
 }
 
+/// Whether a woken lazy pool may be torn back down to the empty-slot state.
+///
+/// True only when the pool is ready, the idle bound has elapsed with no
+/// dispatched turn or heartbeat in flight and no in-flight prompt tasks, no
+/// work is queued, and no wake/respawn task is running. The queue and task
+/// gates make teardown race-safe with enqueue/wake: an event that landed in
+/// the queue (or a wake/respawn already in flight) blocks this decision, so a
+/// queued batch is never stranded — the caller's next loop iteration will
+/// dispatch or wake it instead.
+#[allow(clippy::too_many_arguments)]
+fn idle_pool_sleep_due(
+    pool_ready: bool,
+    last_activity: tokio::time::Instant,
+    now: tokio::time::Instant,
+    bound: Duration,
+    turn_in_flight: bool,
+    prompt_tasks_in_flight: bool,
+    work_queued: bool,
+    wake_or_respawn_in_flight: bool,
+) -> bool {
+    pool_ready
+        && !work_queued
+        && !prompt_tasks_in_flight
+        && !wake_or_respawn_in_flight
+        && inactivity_expired(last_activity, now, bound, turn_in_flight)
+}
+
 #[cfg(test)]
 mod inactivity_tests {
     use super::*;
@@ -1509,6 +1536,179 @@ mod inactivity_tests {
             Duration::from_secs(60),
             false
         ));
+    }
+}
+
+#[cfg(test)]
+mod idle_pool_sleep_tests {
+    use super::*;
+
+    // The all-clear baseline: pool ready, bound elapsed, nothing busy or
+    // queued. Every negative case below flips exactly one gate off this.
+    fn ready_after_bound() -> (tokio::time::Instant, tokio::time::Instant, Duration) {
+        let started = tokio::time::Instant::now();
+        (
+            started,
+            started + Duration::from_secs(61),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn sleeps_when_ready_idle_and_quiet() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(idle_pool_sleep_due(
+            true, last, now, bound, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn zero_bound_never_sleeps() {
+        let (last, now, _) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true,
+            last,
+            now,
+            Duration::ZERO,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn not_ready_never_sleeps() {
+        // A still-sleeping (or waking) pool must not "re-sleep".
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            false, last, now, bound, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn active_turn_defers_sleep() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn in_flight_prompt_task_defers_sleep() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn queued_work_at_boundary_defers_sleep() {
+        // Enqueue-at-teardown protection: a batch sitting in the queue blocks
+        // teardown so it is never stranded — the loop dispatches it instead.
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn wake_or_respawn_in_flight_defers_sleep() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn recent_activity_defers_sleep() {
+        // Activity 50s ago under a 60s bound: not yet idle.
+        let started = tokio::time::Instant::now();
+        let recent = started + Duration::from_secs(50);
+        let now = started + Duration::from_secs(59);
+        assert!(!idle_pool_sleep_due(
+            true,
+            recent,
+            now,
+            Duration::from_secs(60),
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    fn slot(respawn_in_flight: bool) -> SlotCircuit {
+        SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight,
+        }
+    }
+
+    // The call-site signal for the `wake_or_respawn_in_flight` gate is
+    // `any_respawn_in_flight(&crash_history)`, NOT `!respawn_tasks.is_empty()`.
+    // Regression for the PR #5682 review blocker: completed respawn tasks are
+    // never joined from the `respawn_tasks` JoinSet (their payloads arrive
+    // out-of-band via `respawn_rx`), so `!is_empty()` stays true forever after
+    // the first refill/crash recovery and the pool could never re-sleep. The
+    // authoritative signal clears per-slot when the payload is received.
+    #[test]
+    fn respawn_in_flight_signal_gates_then_clears_for_sleep() {
+        let (last, now, bound) = ready_after_bound();
+
+        // A respawn in flight for any slot defers sleep.
+        let busy = [slot(false), slot(true), slot(false)];
+        assert!(any_respawn_in_flight(&busy));
+        assert!(!idle_pool_sleep_due(
+            true,
+            last,
+            now,
+            bound,
+            false,
+            false,
+            false,
+            any_respawn_in_flight(&busy),
+        ));
+
+        // Once the respawn completes (payload received → flag cleared), the
+        // signal goes false and the otherwise-quiet pool becomes sleep-eligible
+        // — even though a naive `!JoinSet.is_empty()` would still be stuck true.
+        let quiet = [slot(false), slot(false), slot(false)];
+        assert!(!any_respawn_in_flight(&quiet));
+        assert!(idle_pool_sleep_due(
+            true,
+            last,
+            now,
+            bound,
+            false,
+            false,
+            false,
+            any_respawn_in_flight(&quiet),
+        ));
+    }
+
+    // The reaper (`respawn_tasks.join_next().now_or_never()` loop) must drain
+    // completed handles so the JoinSet does not grow without bound and so
+    // `!respawn_tasks.is_empty()` cannot become a permanent busy bit if anyone
+    // ever reintroduces it as the gate signal.
+    #[tokio::test]
+    async fn completed_respawn_tasks_are_reaped_from_the_joinset() {
+        let mut respawn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        respawn_tasks.spawn(async {});
+        respawn_tasks.spawn(async {});
+        // Let both tasks run to completion.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // The reaper drains finished handles non-blockingly.
+        while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
+
+        assert!(
+            respawn_tasks.is_empty(),
+            "completed respawn tasks must be reaped so the set does not wedge \
+             the idle-sleep gate or grow unbounded"
+        );
     }
 }
 
@@ -1841,7 +2041,7 @@ async fn tokio_main() -> Result<()> {
             .as_deref()
             .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
         memory_enabled: config.memory_enabled,
-        harness_name: crate::config::normalize_agent_command_identity(&config.agent_identity),
+        harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
     });
 
@@ -1894,6 +2094,27 @@ async fn tokio_main() -> Result<()> {
         None
     } else {
         let interval = inactivity_bound.min(Duration::from_secs(30));
+        Some(tokio::time::interval_at(
+            tokio::time::Instant::now() + interval,
+            interval,
+        ))
+    };
+
+    // Idle pool re-sleep: tear a woken lazy pool back down to the empty-slot
+    // state after `idle_pool_sleep_bound` of quiet, releasing worker
+    // subprocesses. The next accepted event re-wakes it through the same lazy
+    // path. Only meaningful under `lazy_pool`; the tick arm additionally gates
+    // on `pool_ready`, so a still-sleeping pool never re-sleeps. Reuses the
+    // `last_activity` clock the dispatch path already maintains.
+    let idle_pool_sleep_bound = if config.lazy_pool {
+        Duration::from_secs(config.idle_pool_sleep_secs)
+    } else {
+        Duration::ZERO
+    };
+    let mut idle_pool_sleep_reaper = if idle_pool_sleep_bound.is_zero() {
+        None
+    } else {
+        let interval = idle_pool_sleep_bound.min(Duration::from_secs(30));
         Some(tokio::time::interval_at(
             tokio::time::Instant::now() + interval,
             interval,
@@ -2056,16 +2277,13 @@ async fn tokio_main() -> Result<()> {
                 slot.respawn_in_flight = true;
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
-                let identity = config.agent_identity.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result =
-                        spawn_and_init(&cmd, &identity, &args, &env, has_codex, idx, observer)
-                            .await;
+                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
                     guard.send(result);
                 });
             }
@@ -2110,6 +2328,17 @@ async fn tokio_main() -> Result<()> {
                 }
             }
         }
+        // Reap completed respawn handles from the JoinSet. Payloads are
+        // delivered out-of-band through `respawn_rx` (drained above), so the
+        // JoinSet is never joined by the normal flow — Tokio retains finished
+        // tasks until `join_next`, so without this the set grows on every
+        // refill/crash recovery and `!respawn_tasks.is_empty()` would stay true
+        // forever. Non-blocking (`now_or_never`), same pattern as
+        // `drain_ready_join_results` for `pool.join_set`. The authoritative
+        // in-flight signal is `any_respawn_in_flight(&crash_history)` (each
+        // slot's `respawn_in_flight` is cleared when its payload is received),
+        // not JoinSet occupancy.
+        while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
         // Flush requeued events that were waiting for a live agent. Without
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
@@ -2599,6 +2828,56 @@ async fn tokio_main() -> Result<()> {
                             "inactivity bound reached — exiting gracefully"
                         );
                         let _ = shutdown_tx.send(());
+                    }
+                    None
+                }
+                _ = async {
+                    match idle_pool_sleep_reaper.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx; // end split borrow before touching pool
+                    // A wake in flight (pool not yet ready) is covered by the
+                    // pool_ready gate; respawn tasks and in-flight prompt tasks
+                    // are the remaining "busy" signals. Never sleep mid-work:
+                    // `has_undispatched_work()` (not `has_flushable_work()`)
+                    // keeps `work_queued` true for a retry-throttled batch too,
+                    // so a failed turn awaiting backoff is never stranded — the
+                    // next iteration dispatches or re-wakes it.
+                    if idle_pool_sleep_due(
+                        pool_ready,
+                        last_activity,
+                        tokio::time::Instant::now(),
+                        idle_pool_sleep_bound,
+                        queue.has_in_flight() || heartbeat_in_flight,
+                        !pool.join_set.is_empty(),
+                        queue.has_undispatched_work(),
+                        !wake_tasks.is_empty()
+                            || any_respawn_in_flight(&crash_history),
+                    ) {
+                        tracing::info!(
+                            idle_pool_sleep_seconds = config.idle_pool_sleep_secs,
+                            "idle pool sleep bound reached — tearing pool back to lazy state"
+                        );
+                        shutdown_agent_pool(&mut pool).await;
+                        // Return to the exact pre-wake lazy state: empty slots,
+                        // Listening lifecycle. The top-of-loop wake path re-wakes
+                        // on the next accepted event. No second lifecycle.
+                        pool = AgentPool::from_slots(
+                            (0..config.agents).map(|_| None).collect(),
+                        );
+                        pool_ready = false;
+                        pool_lifecycle = PoolLifecycle::listening();
+                        last_activity = tokio::time::Instant::now();
+                        emit_runtime_lifecycle(
+                            observer.as_ref(),
+                            &runtime_start_nonce,
+                            &pubkey_hex,
+                            &config.relay_url,
+                            "listening",
+                            None,
+                        );
                     }
                     None
                 }
@@ -3423,14 +3702,6 @@ fn handle_prompt_result(
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
-    if let Some(final_answer) = result.final_answer.as_ref() {
-        tracing::debug!(
-            target: "pool::final-answer",
-            message_id = %final_answer.message_id,
-            bytes = final_answer.text.len(),
-            "captured fail-closed terminal ACP answer; delivery is intentionally out of scope",
-        );
-    }
     if let PromptSource::Channel(channel_id) = &result.source {
         // The task may have invalidated this session before returning. Never
         // resurrect delivery state for a dead session; its replacement must
@@ -3881,7 +4152,6 @@ fn recover_panicked_agent(
     // Spawn respawn work off the main loop.
     slot.respawn_in_flight = true;
     let cmd = config.agent_command.clone();
-    let identity = config.agent_identity.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
@@ -3890,7 +4160,7 @@ fn recover_panicked_agent(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &identity, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
         guard.send(result);
     });
 }
@@ -4077,7 +4347,6 @@ fn spawn_respawn_task(
 
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
-    let identity = config.agent_identity.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
@@ -4092,7 +4361,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &identity, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
         guard.send(result);
     });
 
@@ -4133,7 +4402,6 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
 struct PoolStartup {
     agents: u32,
     command: String,
-    identity: String,
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
@@ -4146,7 +4414,6 @@ impl PoolStartup {
         Self {
             agents: config.agents,
             command: config.agent_command.clone(),
-            identity: config.agent_identity.clone(),
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
@@ -4164,9 +4431,8 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let spawn_result = AcpClient::spawn_with_identity(
+        let spawn_result = AcpClient::spawn(
             &startup.command,
-            &startup.identity,
             &startup.args,
             &startup.extra_env,
             startup.has_generated_codex_config,
@@ -4267,22 +4533,15 @@ async fn initialize_agent_pool(
 /// borrowing `Config`. All respawn/refill paths use this.
 async fn spawn_and_init(
     command: &str,
-    identity: &str,
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn_with_identity(
-        command,
-        identity,
-        args,
-        extra_env,
-        has_generated_codex_config,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
@@ -4310,12 +4569,8 @@ async fn spawn_and_init(
 }
 
 async fn spawn_auth_client(agent: &AuthAgentArgs) -> Result<AcpClient, acp::AcpError> {
-    let identity = agent
-        .agent_identity
-        .as_deref()
-        .unwrap_or(&agent.agent_command);
-    let agent_args = config::normalize_agent_args(identity, agent.agent_args.clone());
-    AcpClient::spawn_with_identity(&agent.agent_command, identity, &agent_args, &[], false).await
+    let agent_args = config::normalize_agent_args(&agent.agent_command, agent.agent_args.clone());
+    AcpClient::spawn(&agent.agent_command, &agent_args, &[], false).await
 }
 
 fn extract_auth_methods(init_result: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -4436,12 +4691,7 @@ async fn run_authenticate(args: AuthenticateArgs) -> Result<()> {
 async fn run_models(args: ModelsArgs) -> Result<()> {
     use acp::{extract_model_config_options, extract_model_state};
 
-    let identity = args
-        .agent
-        .agent_identity
-        .as_deref()
-        .unwrap_or(&args.agent.agent_command);
-    let agent_args = config::normalize_agent_args(identity, args.agent.agent_args);
+    let agent_args = config::normalize_agent_args(&args.agent.agent_command, args.agent.agent_args);
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("/"))
         .to_string_lossy()
@@ -4449,21 +4699,14 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 
     // Spawn outside the timeout so we always own the child for cleanup.
     // `models` subcommand doesn't use persona packs — no extra env, no codex config.
-    let mut client = match AcpClient::spawn_with_identity(
-        &args.agent.agent_command,
-        identity,
-        &agent_args,
-        &[],
-        false,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: failed to spawn agent: {e}");
-            std::process::exit(1);
-        }
-    };
+    let mut client =
+        match AcpClient::spawn(&args.agent.agent_command, &agent_args, &[], false).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: failed to spawn agent: {e}");
+                std::process::exit(1);
+            }
+        };
 
     // Initialize + session/new under a timeout. Client is owned above,
     // so shutdown() runs on all paths (success, error, timeout).
@@ -5070,6 +5313,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             ),
             (
@@ -5077,6 +5321,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "stream".into(),
                     channel_type: "stream".into(),
+                    description: None,
                 },
             ),
         ]);
@@ -5093,6 +5338,7 @@ mod author_gate_tests {
             relay::ChannelInfo {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
+                description: None,
             },
         )]);
         assert!(
@@ -6253,7 +6499,6 @@ mod build_mcp_servers_tests {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
-            agent_identity: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
@@ -6289,6 +6534,7 @@ mod build_mcp_servers_tests {
             relay_observer: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
+            idle_pool_sleep_secs: 0,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -6476,7 +6722,6 @@ mod error_outcome_emission_tests {
             // harmlessly off the JoinSet — irrelevant to the synchronous
             // feed emission under test.
             agent_command: "true".into(),
-            agent_identity: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
@@ -6512,6 +6757,7 @@ mod error_outcome_emission_tests {
             relay_observer: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
+            idle_pool_sleep_secs: 0,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -6605,7 +6851,6 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
-            final_answer: None,
             batch: None,
         };
 
@@ -6678,7 +6923,6 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
-            final_answer: None,
             batch: None,
         };
 
@@ -6793,7 +7037,6 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
-            final_answer: None,
             batch: None,
         };
 
@@ -6857,7 +7100,6 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(Uuid::new_v4()),
             turn_id: "test-turn-id".to_string(),
             outcome,
-            final_answer: None,
             batch: None,
         };
 
@@ -7026,7 +7268,6 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(Uuid::new_v4()),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
-                final_answer: None,
                 batch: None,
             };
             handle_prompt_result(
@@ -7118,7 +7359,6 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
-                final_answer: None,
                 batch: Some(batch),
             };
             handle_prompt_result(
@@ -7225,7 +7465,6 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
-                final_answer: None,
                 batch: Some(batch),
             };
             handle_prompt_result(
@@ -7318,7 +7557,6 @@ mod error_outcome_emission_tests {
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
-            final_answer: None,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -7413,7 +7651,6 @@ mod error_outcome_emission_tests {
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
-            final_answer: None,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -7529,7 +7766,6 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
-            final_answer: None,
             batch: Some(batch),
         };
 
@@ -7663,7 +7899,6 @@ mod error_outcome_emission_tests {
             // Explicit Stop already dropped the batch upstream in
             // `classify_control_cancel_failure` — `handle_prompt_result`
             // never sees one to requeue.
-            final_answer: None,
             batch: None,
         };
 
@@ -7848,7 +8083,6 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
-            final_answer: None,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -7935,7 +8169,6 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
-            final_answer: None,
             batch: Some(batch),
         };
         handle_prompt_result(

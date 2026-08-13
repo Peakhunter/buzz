@@ -39,14 +39,8 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // Code-execution surface: overriding would let the user run arbitrary
     // binaries/args as the agent process.
     "BUZZ_ACP_AGENT_COMMAND",
-    // Logical builtin identity is projected only by an immutable runtime plan.
-    "BUZZ_ACP_AGENT_IDENTITY",
     "BUZZ_ACP_AGENT_ARGS",
     "BUZZ_ACP_MCP_COMMAND",
-    // Provider executable selection belongs exclusively to an immutable
-    // RuntimeExecutionPlan. Saved or baked values must never redirect it.
-    "CLAUDE_CODE_EXECUTABLE",
-    "CODEX_PATH",
     // Control-plane parallelism: the Desktop resolves the effective
     // worker-pool size (applying any per-harness cap) and writes it into
     // launch.policy_env. A user-supplied BUZZ_ACP_AGENTS would bypass the
@@ -65,6 +59,9 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // Remote lifetime/presence policy: user env must not disable the
     // desktop/provider-owned bounds while the saved record still promises them.
     "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
+    // Desktop-owned pool lifetime policy: user env must not disable or reset
+    // the idle worker-reclamation window while the desktop launcher sets it.
+    "BUZZ_ACP_IDLE_POOL_SLEEP",
     "BUZZ_ACP_NO_PRESENCE",
     // Readiness handoff: desktop is the ONLY readiness source. A saved or
     // ambient env var must not be able to forge setup mode (NotReady) on a

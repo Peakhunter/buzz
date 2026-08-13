@@ -14,13 +14,6 @@ pub(super) async fn run_agent_models_command(
     persisted_model: Option<String>,
     merged_env: BTreeMap<String, String>,
 ) -> Result<AgentModelsResponse, String> {
-    let runtime_plan =
-        crate::managed_agents::runtime_plan::resolve_runtime_execution_plan(&agent_command)?;
-    let agent_command = match runtime_plan.as_ref() {
-        Some(plan) => plan.harness_path()?.display().to_string(),
-        None => agent_command,
-    };
-
     // Clone the env map for redaction below — `merged_env` is moved
     // into the spawn_blocking closure and we still need the values to
     // scrub any user-supplied secrets that the child surfaces in stderr.
@@ -45,7 +38,6 @@ pub(super) async fn run_agent_models_command(
         }
         cmd.arg("models")
             .arg("--json")
-            .env_remove(crate::managed_agents::runtime_plan::AGENT_IDENTITY_ENV)
             .env("BUZZ_ACP_AGENT_COMMAND", &agent_command)
             .env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
         if let Some(meta) = known_acp_runtime(&agent_command) {
@@ -62,15 +54,7 @@ pub(super) async fn run_agent_models_command(
         for (k, v) in &merged_env {
             cmd.env(k, v);
         }
-        if let Some(plan) = runtime_plan.as_ref() {
-            plan.verify()?;
-            plan.apply_environment(&mut cmd);
-        } else {
-            crate::managed_agents::configure_runtime_cli(
-                &mut cmd,
-                known_acp_runtime(&agent_command),
-            );
-        }
+        crate::managed_agents::configure_runtime_cli(&mut cmd, known_acp_runtime(&agent_command));
         crate::util::configure_no_window(&mut cmd);
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

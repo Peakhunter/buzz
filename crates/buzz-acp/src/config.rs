@@ -191,10 +191,6 @@ pub struct AuthAgentArgs {
     #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND", default_value = "goose")]
     pub agent_command: String,
 
-    /// Trusted logical runtime identity when the executable has a generic name.
-    #[arg(long, env = "BUZZ_ACP_AGENT_IDENTITY", hide = true)]
-    pub agent_identity: Option<String>,
-
     /// Arguments passed to the agent binary.
     #[arg(
         long,
@@ -253,10 +249,6 @@ pub struct CliArgs {
 
     #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND", default_value = "goose")]
     pub agent_command: String,
-
-    /// Trusted logical runtime identity when the executable has a generic name.
-    #[arg(long, env = "BUZZ_ACP_AGENT_IDENTITY", hide = true)]
-    pub agent_identity: Option<String>,
 
     #[arg(
         long,
@@ -490,6 +482,13 @@ pub struct CliArgs {
     /// Connect and subscribe before starting the ACP/LLM subprocess pool.
     #[arg(long, env = "BUZZ_ACP_LAZY_POOL", default_value_t = false)]
     pub lazy_pool: bool,
+
+    /// Tear the woken pool back down to the lazy empty-slot state after this
+    /// many seconds with no dispatched turn in flight and an empty queue,
+    /// releasing worker subprocesses until the next accepted event re-wakes.
+    /// Requires `--lazy-pool`; ignored otherwise. 0 disables idle re-sleep.
+    #[arg(long, env = "BUZZ_ACP_IDLE_POOL_SLEEP", default_value_t = 0)]
+    pub idle_pool_sleep: u64,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -506,7 +505,6 @@ pub struct Config {
     pub keys: Keys,
     pub relay_url: String,
     pub agent_command: String,
-    pub agent_identity: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
     pub idle_timeout_secs: u64,
@@ -568,6 +566,10 @@ pub struct Config {
     pub exit_after_inactivity_secs: u64,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
     pub lazy_pool: bool,
+    /// Seconds with no dispatched turn in flight and an empty queue before a
+    /// woken lazy pool is torn back down to the empty-slot state. 0 = disabled.
+    /// Only meaningful when `lazy_pool` is true.
+    pub idle_pool_sleep_secs: u64,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -921,14 +923,7 @@ impl Config {
             ));
         }
 
-        let agent_identity = args.agent_identity.unwrap_or_else(|| agent_command.clone());
-        if agent_identity.trim().is_empty() {
-            return Err(ConfigError::ConfigFile(
-                "agent_identity must not be empty".into(),
-            ));
-        }
-
-        let agent_args = normalize_agent_args(&agent_identity, args.agent_args);
+        let agent_args = normalize_agent_args(&agent_command, args.agent_args);
 
         if let Some(ref channels) = args.channels {
             for ch in channels {
@@ -1067,7 +1062,7 @@ impl Config {
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
         // for non-Codex agents or unparseable relay URLs.
         let has_generated_codex_config =
-            if let Some(network_env) = codex_network_env(&agent_identity, &args.relay_url) {
+            if let Some(network_env) = codex_network_env(&agent_command, &args.relay_url) {
                 persona_env_vars.push(network_env);
                 true
             } else {
@@ -1080,7 +1075,6 @@ impl Config {
             keys,
             relay_url: args.relay_url,
             agent_command,
-            agent_identity,
             agent_args,
             mcp_command: args.mcp_command,
             idle_timeout_secs,
@@ -1124,6 +1118,7 @@ impl Config {
             relay_observer: args.relay_observer,
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
+            idle_pool_sleep_secs: args.idle_pool_sleep,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1460,7 +1455,6 @@ mod tests {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
-            agent_identity: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -1496,6 +1490,7 @@ mod tests {
             relay_observer: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
+            idle_pool_sleep_secs: 0,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -2217,6 +2212,22 @@ channels = "ALL"
     }
 
     #[test]
+    fn idle_pool_sleep_defaults_disabled_and_accepts_cli_value() {
+        let key = "0".repeat(64);
+        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(default.idle_pool_sleep, 0);
+
+        let configured = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--idle-pool-sleep",
+            "300",
+        ]);
+        assert_eq!(configured.idle_pool_sleep, 300);
+    }
+
+    #[test]
     fn lazy_pool_cli_flag_enables_deferred_startup() {
         let key = "0".repeat(64);
         let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", &key, "--lazy-pool=true"]);
@@ -2759,37 +2770,6 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
-
-    #[test]
-    fn production_codex_identity_controls_config_for_generic_executable() {
-        let args = CliArgs::try_parse_from([
-            "buzz-acp",
-            "--private-key",
-            TEST_PRIVATE_KEY,
-            "--relay-url",
-            "wss://relay.example.com",
-            "--agent-command",
-            "/opt/codex-acp/dist/index.js",
-            "--agent-identity",
-            "codex",
-        ])
-        .expect("clap should parse separate command and identity");
-        let config = Config::from_args(args).expect("logical Codex identity should configure");
-
-        assert_eq!(config.agent_identity, "codex");
-        assert!(config.has_generated_codex_config);
-        let network_access = config
-            .persona_env_vars
-            .iter()
-            .find(|(key, _)| key == "CODEX_CONFIG")
-            .and_then(|(_, value)| serde_json::from_str::<serde_json::Value>(value).ok())
-            .and_then(|value| {
-                value
-                    .pointer("/sandbox_workspace_write/network_access")
-                    .and_then(serde_json::Value::as_bool)
-            });
-        assert_eq!(network_access, Some(true));
-    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

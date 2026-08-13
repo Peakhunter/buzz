@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use crate::acp::{
     extract_model_config_options, extract_model_state, model_in_catalog,
-    resolve_model_switch_method, AcpClient, AcpError, EnvVar, FinalAnswer, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport,
+    resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer, ModelSwitchMethod,
+    StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -279,9 +279,6 @@ pub struct PromptResult {
     /// Identifies the completed turn for observer terminal events.
     pub turn_id: String,
     pub outcome: PromptOutcome,
-    /// Adapter-typed terminal answer. Present only for an unambiguous
-    /// `final_answer` group followed by `end_turn`.
-    pub final_answer: Option<FinalAnswer>,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
 }
@@ -527,6 +524,7 @@ impl ChannelInfoResolver {
                     PromptChannelInfo {
                         name: info.name,
                         channel_type: info.channel_type,
+                        description: info.description,
                     },
                 ))
             })
@@ -1432,19 +1430,11 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
-    let final_answer = agent.acp.take_completed_prompt_result().and_then(|result| {
-        if matches!(outcome, PromptOutcome::Ok(StopReason::EndTurn)) {
-            result.final_answer
-        } else {
-            None
-        }
-    });
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         turn_id: turn_id.to_owned(),
         outcome,
-        final_answer,
         batch,
     });
 }
@@ -1860,6 +1850,16 @@ pub async fn run_prompt_task(
                     if !agent.has_system_prompt_support() {
                         agent.state.mark_channel_delivery_success(*cid, true, []);
                     }
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        Some(*cid),
+                        &session_id,
+                        &format!("{turn_id}:initial"),
+                        Some(acp_stop_to_core(&stop_reason)),
+                    )
+                    .await;
                 }
                 Err(AcpError::AgentExited) => {
                     agent.state.invalidate_all();
@@ -1884,7 +1884,17 @@ pub async fn run_prompt_task(
                         .cancel_with_cleanup(&session_id, ctx.idle_timeout)
                         .await
                     {
-                        Ok(_) => {
+                        Ok(stop_reason) => {
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                Some(*cid),
+                                &session_id,
+                                &format!("{turn_id}:initial"),
+                                Some(acp_stop_to_core(&stop_reason)),
+                            )
+                            .await;
                             agent.state.invalidate(&source);
                         }
                         Err(AcpError::AgentExited) => {
@@ -2296,7 +2306,7 @@ pub async fn run_prompt_task(
                             agent,
                             source,
                             PromptOutcome::Ok(StopReason::EndTurn),
-                            None,
+                            None, // turn succeeded — batch was processed, no requeue
                         );
                         return;
                     }
@@ -2588,17 +2598,25 @@ pub(crate) async fn fetch_channel_info(
                 let ev = events.first()?;
                 let tags = ev.get("tags")?.as_array()?;
                 let mut name = None;
+                let mut description = None;
                 for tag in tags {
                     if let Some(arr) = tag.as_array() {
-                        if arr.first().and_then(|v| v.as_str()) == Some("name") {
-                            name = arr.get(1).and_then(|v| v.as_str());
+                        match arr.first().and_then(|v| v.as_str()) {
+                            Some("name") => name = arr.get(1).and_then(|v| v.as_str()),
+                            Some("about") => description = arr.get(1).and_then(|v| v.as_str()),
+                            _ => {}
                         }
                     }
                 }
                 let channel_type = crate::relay::channel_type_from_tags(tags);
+                let description = description
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 Some(PromptChannelInfo {
                     name: name.unwrap_or(UNKNOWN_CHANNEL_NAME).to_string(),
                     channel_type,
+                    description,
                 })
             }
             Ok(Err(e)) => {
@@ -5814,6 +5832,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -5975,6 +5994,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -7863,6 +7883,38 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             1,
             "a resolved channel is cached — no second lookup"
         );
+        server.abort();
+    }
+
+    /// A channel's `about` tag is parsed through the lazy-fetch path and
+    /// delivered as the resolved description.
+    #[tokio::test]
+    async fn test_channel_resolver_delivers_description() {
+        let id = Uuid::new_v4();
+        let response = channel_metadata_response(
+            id,
+            &[
+                ["name", "team-chat"],
+                ["t", "stream"],
+                ["about", "Engineering discussions"],
+            ],
+        );
+        let (resolver, _requests, server) = counting_resolver(response).await;
+
+        let info = resolver.resolve(id).await.expect("should resolve");
+        assert_eq!(info.description.as_deref(), Some("Engineering discussions"));
+        server.abort();
+    }
+
+    /// A metadata event with no `about` tag yields no description.
+    #[tokio::test]
+    async fn test_channel_resolver_absent_description_when_no_about_tag() {
+        let id = Uuid::new_v4();
+        let response = channel_metadata_response(id, &[["name", "buzz-dev"], ["t", "stream"]]);
+        let (resolver, _requests, server) = counting_resolver(response).await;
+
+        let info = resolver.resolve(id).await.expect("should resolve");
+        assert_eq!(info.description, None);
         server.abort();
     }
 

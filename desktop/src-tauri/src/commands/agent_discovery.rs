@@ -138,6 +138,7 @@ pub async fn save_custom_harness(
     // so concurrent saves never produce a stale registry snapshot (B-6).
     custom_harnesses::save_and_warm(&custom_dir, &definition, rename_old_id.as_deref())?;
 
+    // Resolve availability for the returned catalog entry.
     let (availability, command_opt, binary_path) =
         match crate::managed_agents::find_command(&definition.command) {
             Some(path) => (
@@ -147,6 +148,7 @@ pub async fn save_custom_harness(
             ),
             None => (AcpAvailabilityStatus::NotInstalled, None, None),
         };
+
     let default_args =
         crate::managed_agents::normalize_agent_args(&definition.command, definition.args.clone());
 
@@ -157,8 +159,6 @@ pub async fn save_custom_harness(
         availability,
         command: command_opt,
         binary_path,
-        runtime_plan_id: None,
-        runtime_plan_source: None,
         default_args,
         mcp_command: None,
         model_env_var: None,

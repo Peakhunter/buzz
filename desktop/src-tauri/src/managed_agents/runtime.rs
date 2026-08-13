@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use tauri::AppHandle;
 
-use super::agent_env::build_buzz_agent_provider_defaults;
+use super::agent_env::{build_buzz_agent_provider_defaults, idle_pool_sleep_env};
 
 use crate::{
     managed_agents::{
         append_log_marker, known_acp_runtime, login_shell_path, managed_agent_log_path,
         missing_command_message, normalize_agent_args, open_log_file, resolve_command,
-        runtime_plan::resolve_runtime_execution_plan, spawn_key_refusal, KnownAcpRuntime,
-        ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey, ManagedAgentSummary,
+        spawn_key_refusal, KnownAcpRuntime, ManagedAgentPairRuntime, ManagedAgentRecord,
+        ManagedAgentRuntimeKey, ManagedAgentSummary,
     },
     util::now_iso,
 };
@@ -458,9 +458,6 @@ pub fn spawn_agent_child(
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
 
-    let runtime_plan = resolve_runtime_execution_plan(effective_command)
-        .map_err(|error| format!("agent {} runtime plan: {error}", record.pubkey))?;
-
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
         &log_path,
@@ -494,13 +491,10 @@ pub fn spawn_agent_child(
             }
         }
     };
-    // Custom harnesses remain on the legacy resolver until they gain a trust flow.
-    let resolved_agent_command = match runtime_plan.as_ref() {
-        Some(plan) => plan.harness_path()?.display().to_string(),
-        None => resolve_command(effective_command)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| effective_command.clone()),
-    };
+    // Resolve agent command to a full path (DMG launches have minimal PATH).
+    let resolved_agent_command = resolve_command(effective_command)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| effective_command.clone());
 
     // The caller supplies the explicit canonical pair relay. This is the only
     // relay this child may connect to, regardless of the record/workspace default.
@@ -537,8 +531,8 @@ pub fn spawn_agent_child(
     command.env("BUZZ_PRIVATE_KEY", &record.private_key_nsec);
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
     command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
+    command.env("BUZZ_ACP_IDLE_POOL_SLEEP", idle_pool_sleep_env(lazy));
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
-    command.env_remove(super::runtime_plan::AGENT_IDENTITY_ENV);
     command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
     match &resolved_mcp_command {
         Some(mcp_cmd) => {
@@ -720,7 +714,19 @@ pub fn spawn_agent_child(
     } else {
         command.env_remove("BUZZ_ACP_SYSTEM_PROMPT");
     }
-    if let Some(model) = effective_model.as_deref() {
+    // Shared compute stores `auto`, but the wire name is MeshLLM's virtual
+    // `mesh` model. Translate here too, so the harness and the LLM client are
+    // told the same thing: `BUZZ_ACP_MODEL=auto` would name a model the mesh
+    // never advertises, leaving buzz-acp to warn and fall back on every new
+    // session while `BUZZ_AGENT_MODEL` said `mesh`.
+    #[cfg(feature = "mesh-llm")]
+    let acp_model = match (&mesh_model_id, effective_model.as_deref()) {
+        (Some(mesh_model_id), _) => Some(super::relay_mesh_wire_model(mesh_model_id).to_string()),
+        (None, model) => model.map(str::to_owned),
+    };
+    #[cfg(not(feature = "mesh-llm"))]
+    let acp_model = effective_model.as_deref().map(str::to_owned);
+    if let Some(model) = acp_model.as_deref() {
         command.env("BUZZ_ACP_MODEL", model);
     } else {
         command.env_remove("BUZZ_ACP_MODEL");
@@ -816,11 +822,7 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
-    if let Some(plan) = runtime_plan.as_ref() {
-        plan.apply_environment(&mut command);
-    } else {
-        configure_runtime_cli(&mut command, runtime_meta);
-    }
+    configure_runtime_cli(&mut command, runtime_meta);
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible
     // transport at spawn time and scrub any unrelated ambient OpenAI key.
@@ -875,11 +877,6 @@ pub fn spawn_agent_child(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    // Make the final filesystem operation before exec a complete plan
-    // revalidation. Any detected drift blocks the spawn without rediscovery.
-    if let Some(plan) = runtime_plan.as_ref() {
-        plan.verify()?;
-    }
     let child = command.spawn().map_err(|error| {
         format!(
             "failed to spawn `{}` for agent {}: {error}",

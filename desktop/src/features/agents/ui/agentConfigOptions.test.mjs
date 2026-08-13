@@ -6,7 +6,6 @@ import {
   getPersonaModelOptions,
   getPersonaProviderOptions,
   getProviderApiKeyLabel,
-  formatRuntimeOptionLabel,
   resetConfigForHarnessChange,
   runtimeSupportsLlmProviderSelection,
 } from "./agentConfigOptions.tsx";
@@ -24,34 +23,6 @@ function makeRuntime(id, availability = "available") {
     availability,
   };
 }
-
-test("formatRuntimeOptionLabel surfaces verified external plan identity", () => {
-  const runtime = makeRuntime("codex");
-  runtime.label = "Codex";
-  runtime.runtimePlanSource = "verified_external";
-  runtime.runtimePlanId = "0123456789abcdef0123456789abcdef";
-  assert.equal(
-    formatRuntimeOptionLabel(runtime),
-    "Codex (verified external · 0123456789ab)",
-  );
-});
-
-test("formatRuntimeOptionLabel keeps unavailability ahead of plan metadata", () => {
-  const runtime = makeRuntime("codex", "cli_missing");
-  runtime.runtimePlanSource = "verified_external";
-  runtime.runtimePlanId = "0123456789abcdef";
-  assert.equal(formatRuntimeOptionLabel(runtime), "codex (CLI missing)");
-});
-
-test("formatRuntimeOptionLabel identifies an unbundled managed adapter", () => {
-  const runtime = makeRuntime("codex");
-  runtime.runtimePlanSource = "managed";
-  runtime.runtimePlanId = "abcdef0123456789";
-  assert.equal(
-    formatRuntimeOptionLabel(runtime),
-    "codex (managed adapter · abcdef012345)",
-  );
-});
 
 // ── getPersonaProviderOptions — hideProviderIds ───────────────────────────────
 
