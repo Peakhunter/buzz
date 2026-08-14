@@ -400,7 +400,7 @@ function appendAgentEvents(
   const admissible = floor
     ? events.filter((event) => isObserverEventAfter(event, floor))
     : events;
-  if (admissible.length === 0) return false;
+  if (admissible.length === 0) return [];
 
   const seen = new Set(
     current.map(
