@@ -1325,7 +1325,9 @@ async fn serve(
             .map_err(|e| anyhow::anyhow!("Failed to bind UDS {uds_path}: {e}"))?;
         info!(path = %uds_path, "buzz-relay UDS listening");
 
-        let router_uds = router.clone();
+        let router_uds = router
+            .clone()
+            .layer(axum::Extension(buzz_relay::request_origin::UdsIngress));
         let mut uds_rx = shutdown_tx.subscribe();
         let uds_handle = tokio::spawn(async move {
             axum::serve(uds_listener, router_uds.into_make_service())

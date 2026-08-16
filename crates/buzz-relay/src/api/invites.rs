@@ -261,6 +261,10 @@ async fn authenticate(
     Ok((tenant, pubkey))
 }
 
+fn invite_landing_url(relay_origin: &crate::request_origin::RelayOrigin, code: &str) -> String {
+    relay_origin.http_url(&format!("/invite/{code}"))
+}
+
 /// Mint an invite code — `POST /api/invites`, NIP-98 signed by an owner/admin.
 ///
 /// Returns the code, its expiry, and a shareable landing-page URL on the
@@ -312,13 +316,7 @@ pub async fn mint_invite(
             error => internal_error(&format!("invite mint: {error}")),
         })?;
 
-    // Same TLS-posture logic as nip98_expected_url: wss deployments get an
-    // https landing page URL, ws dev/test deployments get http.
-    let scheme = if state.config.relay_url.trim_start().starts_with("wss://") {
-        "https"
-    } else {
-        "http"
-    };
+    let landing_url = invite_landing_url(&relay_origin, &invite.code);
 
     tracing::info!(
         community = %tenant.community(),
@@ -337,7 +335,7 @@ pub async fn mint_invite(
         "expires_at": expires_at_unix,
         "max_uses": invite.max_uses,
         "uses_remaining": invite.uses_remaining,
-        "url": format!("{scheme}://{}/invite/{}", tenant.host(), invite.code),
+        "url": landing_url,
     })))
 }
 
@@ -536,7 +534,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{claim_key_rate_limited, CLAIM_RATE_LIMIT, MAX_INVITE_USES, MIN_INVITE_TTL_SECS};
+    use super::{
+        claim_key_rate_limited, invite_landing_url, CLAIM_RATE_LIMIT, MAX_INVITE_USES,
+        MIN_INVITE_TTL_SECS,
+    };
     use axum::{
         body::{to_bytes, Body},
         http::{header, Request, StatusCode},
@@ -571,6 +572,22 @@ mod tests {
     }
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
+
+    #[test]
+    fn invite_landing_url_uses_exact_request_origin() {
+        let direct =
+            crate::request_origin::RelayOrigin::parse("ws://buzz.peakhunter.com:3000").unwrap();
+        let secure =
+            crate::request_origin::RelayOrigin::parse("wss://buzz.peakhunter.com:8443").unwrap();
+        assert_eq!(
+            invite_landing_url(&direct, "code"),
+            "http://buzz.peakhunter.com:3000/invite/code"
+        );
+        assert_eq!(
+            invite_landing_url(&secure, "code"),
+            "https://buzz.peakhunter.com:8443/invite/code"
+        );
+    }
 
     fn claim_cache(
         capacity: u64,
