@@ -474,8 +474,11 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
 
 #[cfg(test)]
 mod tests {
+    use axum::extract::Extension;
+    use axum::http::header;
     use axum::{routing::get, Router};
     use futures_util::SinkExt;
+    use nostr::Keys;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use tokio::net::TcpListener;
@@ -569,6 +572,83 @@ mod tests {
             http.span_context.trace_id()
         );
         assert_eq!(datastore.parent_span_id, http.span_context.span_id());
+    }
+
+    async fn isolated_origin_state() -> Arc<AppState> {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.database_url = "postgres://buzz@127.0.0.1:1/buzz".to_string();
+        config.read_database_url = None;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.relay_url = "ws://buzz.peakhunter.com:3000".to_string();
+        config.relay_origin =
+            crate::request_origin::RelayOrigin::parse(&config.relay_url).expect("direct origin");
+        config.accepted_relay_origins = std::collections::HashSet::from([
+            config.relay_origin.clone(),
+            crate::request_origin::RelayOrigin::parse("wss://buzz.peakhunter.com:8443")
+                .expect("TLS origin"),
+        ]);
+        config.trusted_proxy_ips.clear();
+
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn root_websocket_uses_uds_ingress_for_forwarded_origin() {
+        let app = Router::new()
+            .route("/", get(nip11_or_ws_handler))
+            .with_state(isolated_origin_state().await)
+            .layer(Extension(crate::request_origin::UdsIngress));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "buzz.peakhunter.com:3000")
+                    .header("x-forwarded-proto", "https")
+                    .header("x-forwarded-host", "buzz.peakhunter.com:8443")
+                    .header(header::CONNECTION, "upgrade")
+                    .header(header::UPGRADE, "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        // Correct UDS resolution proceeds to tenant binding. The isolated lazy
+        // database then fails closed as an unknown-community 404. The current
+        // TCP-only root path instead returns 400 before reaching that gate.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn handler_receives_message_with_limit(limit: usize, size: usize) -> bool {
