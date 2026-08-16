@@ -356,7 +356,7 @@ mod tests {
         );
 
         assert!(matches!(
-            verify_blossom_get_auth(&event, &sha256, Some("relay.example"), 600),
+            verify_blossom_get_auth(&event, &sha256, None, 600),
             Err(MediaError::InsufficientScope)
         ));
     }
