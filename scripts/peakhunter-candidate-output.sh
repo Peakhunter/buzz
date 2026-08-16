@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Exclusive ownership helpers for immutable candidate output directories.
 
-BUILD_COMPLETE="${BUILD_COMPLETE:-false}"
-OUTPUT_OWNED="${OUTPUT_OWNED:-false}"
+# These flags are process-internal proof state. Never trust or export inherited
+# values: a poisoned OUTPUT_OWNED could authorize deleting an unclaimed path,
+# while a poisoned BUILD_COMPLETE could suppress cleanup of an incomplete build.
+unset BUILD_COMPLETE OUTPUT_OWNED
+BUILD_COMPLETE=false
+OUTPUT_OWNED=false
 
 claim_output_root() {
   local parent

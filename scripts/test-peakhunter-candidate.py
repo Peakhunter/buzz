@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -41,8 +42,23 @@ def verify_exclusive_output_claim() -> None:
                 str(existing),
             ],
             check=False,
+            env={**os.environ, "OUTPUT_OWNED": "true", "BUILD_COMPLETE": "false"},
         )
         assert rejected.returncode != 0
+        assert sentinel.read_text(encoding="utf-8") == "owned elsewhere"
+
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; OUTPUT_ROOT="$2"; claim_output_root || true; cleanup_output_root',
+                "bash",
+                str(OUTPUT_HELPER),
+                str(existing),
+            ],
+            check=True,
+            env={**os.environ, "OUTPUT_OWNED": "true", "BUILD_COMPLETE": "false"},
+        )
         assert sentinel.read_text(encoding="utf-8") == "owned elsewhere"
 
         claimed = parent / "claimed"
@@ -56,6 +72,7 @@ def verify_exclusive_output_claim() -> None:
                 str(claimed),
             ],
             check=True,
+            env={**os.environ, "OUTPUT_OWNED": "false", "BUILD_COMPLETE": "true"},
         )
         assert not claimed.exists()
 
