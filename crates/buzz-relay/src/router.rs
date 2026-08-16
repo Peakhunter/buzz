@@ -302,13 +302,26 @@ async fn nip11_or_ws_handler(
         return Json(nip11_document(&state, raw_host).await).into_response();
     }
 
-    let relay_origin = match crate::request_origin::resolve_request_origin(
-        addr,
-        &headers,
-        &state.config.relay_origin,
-        &state.config.accepted_relay_origins,
-        &state.config.trusted_proxy_ips,
-    ) {
+    let relay_origin = if req
+        .extensions()
+        .get::<crate::request_origin::UdsIngress>()
+        .is_some()
+    {
+        crate::request_origin::resolve_uds_request_origin(
+            &headers,
+            &state.config.relay_origin,
+            &state.config.accepted_relay_origins,
+        )
+    } else {
+        crate::request_origin::resolve_request_origin(
+            addr,
+            &headers,
+            &state.config.relay_origin,
+            &state.config.accepted_relay_origins,
+            &state.config.trusted_proxy_ips,
+        )
+    };
+    let relay_origin = match relay_origin {
         Ok(origin) => origin,
         Err(_) => {
             return (StatusCode::BAD_REQUEST, "invalid request origin").into_response();
