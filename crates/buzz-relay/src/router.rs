@@ -46,7 +46,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(RequestBodyLimitLayer::new(media_body_limit))
         .with_state(state.clone());
 
-    let git_router = api::git::git_router(state.clone());
+    let git_router = api::git::git_router(state.clone()).layer(middleware::from_fn_with_state(
+        state.clone(),
+        crate::request_origin::resolve_origin_middleware,
+    ));
 
     let git_policy_router = api::git::git_policy_router(state.clone());
 
@@ -59,6 +62,32 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let admin_router = admin_enabled
         .then(|| Router::new().nest("/api/admin/v1", api::admin::router(state.clone())));
 
+    // Routes whose signed authentication must bind to the exact client-visible
+    // relay origin. Keep this middleware off deployment-global operator/admin,
+    // health, media, webhook, and localhost-only policy routes.
+    let origin_api_router = Router::new()
+        .route("/events", post(api::bridge::submit_event))
+        .route("/query", post(api::bridge::query_events))
+        .route("/count", post(api::bridge::count_events))
+        .route("/api/invites", post(api::invites::mint_invite))
+        .route("/api/invites/claim", post(api::invites::claim_invite))
+        .route("/moderation/reports", get(api::bridge::moderation_reports))
+        .route("/moderation/audit", get(api::bridge::moderation_audit))
+        .route(
+            "/moderation/restricted",
+            get(api::bridge::moderation_restricted),
+        )
+        .route(
+            "/huddle/{channel_id}/audio",
+            get(audio::handler::ws_audio_handler),
+        )
+        .layer(RequestBodyLimitLayer::new(1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::request_origin::resolve_origin_middleware,
+        ))
+        .with_state(state.clone());
+
     let api_router = Router::new()
         // WebSocket + NIP-11
         .route("/", get(nip11_or_ws_handler))
@@ -68,10 +97,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_handler))
         .route("/_liveness", get(liveness_handler))
         .route("/_readiness", get(readiness_handler))
-        // Nostr HTTP bridge (NIP-98 auth)
-        .route("/events", post(api::bridge::submit_event))
-        .route("/query", post(api::bridge::query_events))
-        .route("/count", post(api::bridge::count_events))
         .route(
             "/operator/communities",
             get(api::operator::list_owned_communities).post(api::operator::provision_community),
@@ -92,8 +117,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/operator/communities/transfer",
             post(api::operator::transfer_community),
         )
-        // Relay invites: mint (owner/admin) + claim (membership-gate exempt)
-        .route("/api/invites", post(api::invites::mint_invite))
+        // Public invite policy routes do not use signed relay-origin auth.
         .route("/api/join-policy", get(api::invites::join_policy))
         // Policy documents as standalone pages — desktop opens these in the
         // system browser instead of rendering the Markdown in-app.
@@ -109,24 +133,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/invites/accept-policy",
             post(api::invites::accept_policy),
         )
-        .route("/api/invites/claim", post(api::invites::claim_invite))
-        // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
-        .route("/moderation/reports", get(api::bridge::moderation_reports))
-        .route("/moderation/audit", get(api::bridge::moderation_audit))
-        .route(
-            "/moderation/restricted",
-            get(api::bridge::moderation_restricted),
-        )
         // Webhook trigger (secret-authenticated, no NIP-98)
         .route("/hooks/{id}", post(api::bridge::workflow_webhook))
         // Mesh demo echo probe — testbed-only; 404 unless BUZZ_MESH=on and
         // BUZZ_MESH_DEMO_ECHO=on (see api::mesh_demo).
         .route("/_mesh/demo/echo", post(api::mesh_demo::demo_echo))
-        // Huddle audio WebSocket route
-        .route(
-            "/huddle/{channel_id}/audio",
-            get(audio::handler::ws_audio_handler),
-        )
         // Reject request bodies larger than 1 MB to prevent resource exhaustion.
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
         .with_state(state.clone());
@@ -134,6 +145,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Merge — each sub-router carries its own body limit.
     // Metrics → Trace → CORS applied once over the combined router.
     let mut merged = api_router
+        .merge(origin_api_router)
         .merge(media_router)
         .merge(git_router)
         .merge(git_policy_router);
@@ -290,6 +302,19 @@ async fn nip11_or_ws_handler(
         return Json(nip11_document(&state, raw_host).await).into_response();
     }
 
+    let relay_origin = match crate::request_origin::resolve_request_origin(
+        addr,
+        &headers,
+        &state.config.relay_origin,
+        &state.config.accepted_relay_origins,
+        &state.config.trusted_proxy_ips,
+    ) {
+        Ok(origin) => origin,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "invalid request origin").into_response();
+        }
+    };
+
     // Row zero: bind the connection to its community from the request host
     // BEFORE the WebSocket upgrade, so no frame is ever read on an unbound
     // connection. The host is the authoritative selector; an unmapped host or a
@@ -324,7 +349,9 @@ async fn nip11_or_ws_handler(
                 return (StatusCode::SERVICE_UNAVAILABLE, "relay restarting").into_response();
             }
             limit_relay_websocket(ws, max_frame_bytes)
-                .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant))
+                .on_upgrade(move |socket| {
+                    handle_connection(socket, state, addr, tenant, relay_origin)
+                })
                 .into_response()
         }
         Err(_) => {

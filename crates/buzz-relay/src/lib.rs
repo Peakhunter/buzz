@@ -33,6 +33,8 @@ pub mod nip11;
 pub mod protocol;
 /// Durable NIP-PL matcher and delivery worker.
 pub mod push_runtime;
+/// Source-bound public relay origin resolution.
+pub mod request_origin;
 /// Axum router construction.
 pub mod router;
 /// Shared application state.

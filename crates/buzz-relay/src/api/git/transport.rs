@@ -131,9 +131,12 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         let tenant = crate::tenant::bind_community(&state.db, raw_host)
             .await
             .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
+        let relay_origin = parts
+            .extensions
+            .get::<crate::request_origin::RelayOrigin>()
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid request origin").into_response())?;
         let expected_url = git_expected_url(
-            &state.config.relay_url,
-            &tenant,
+            relay_origin,
             parts
                 .uri
                 .path_and_query()
@@ -321,15 +324,9 @@ fn enforce_git_ban_cascade(
 /// signed for community A's URL just because the deployment has one global
 /// `relay_url`.
 fn git_expected_url(
-    config_relay_url: &str,
-    tenant: &TenantContext,
+    relay_origin: &crate::request_origin::RelayOrigin,
     path_and_query: &str,
 ) -> Option<String> {
-    let scheme = if config_relay_url.trim_start().starts_with("wss://") {
-        "https"
-    } else {
-        "http"
-    };
     let repo_path = if let Some((prefix, _query)) = path_and_query.split_once("/info/refs") {
         prefix
     } else if let Some(prefix) = path_and_query.strip_suffix("/git-upload-pack") {
@@ -337,7 +334,7 @@ fn git_expected_url(
     } else {
         path_and_query.strip_suffix("/git-receive-pack")?
     };
-    Some(format!("{scheme}://{}{repo_path}", tenant.host()))
+    Some(relay_origin.http_url(repo_path))
 }
 
 /// Validate URL `(owner, repo)` parameters and return the canonical repo
@@ -2449,18 +2446,16 @@ mod track_c_tests {
 
     #[test]
     fn git_expected_url_uses_tenant_host_not_config_host() {
-        let tenant_a = tenant("host-a.example", 1);
-        let tenant_b = tenant("host-b.example", 2);
+        let origin_a = crate::request_origin::RelayOrigin::parse("wss://host-a.example").unwrap();
+        let origin_b = crate::request_origin::RelayOrigin::parse("wss://host-b.example").unwrap();
 
         let url_a = git_expected_url(
-            "wss://config-host.example",
-            &tenant_a,
+            &origin_a,
             "/git/owner/repo/info/refs?service=git-upload-pack",
         )
         .expect("recognized info/refs path");
         let url_b = git_expected_url(
-            "wss://config-host.example",
-            &tenant_b,
+            &origin_b,
             "/git/owner/repo/info/refs?service=git-upload-pack",
         )
         .expect("recognized info/refs path");
@@ -2469,12 +2464,8 @@ mod track_c_tests {
         assert_eq!(url_b, "https://host-b.example/git/owner/repo");
         assert_ne!(url_a, url_b);
 
-        let url_a_alt_config = git_expected_url(
-            "wss://different-config.example",
-            &tenant_a,
-            "/git/owner/repo/git-upload-pack",
-        )
-        .expect("recognized upload-pack path");
+        let url_a_alt_config = git_expected_url(&origin_a, "/git/owner/repo/git-upload-pack")
+            .expect("recognized upload-pack path");
         assert_eq!(url_a_alt_config, "https://host-a.example/git/owner/repo");
     }
 
@@ -2487,10 +2478,9 @@ mod track_c_tests {
         let keys = Keys::generate();
         let signed_for_a = "https://host-a.example/git/alice/repo";
         let event_json = git_nip98_event_json(&keys, signed_for_a, "GET");
-        let tenant_b = tenant("host-b.example", 2);
+        let origin_b = crate::request_origin::RelayOrigin::parse("wss://host-b.example").unwrap();
         let expected_for_b = git_expected_url(
-            "wss://host-a.example",
-            &tenant_b,
+            &origin_b,
             "/git/alice/repo/info/refs?service=git-upload-pack",
         )
         .expect("recognized info/refs path");
@@ -2508,13 +2498,9 @@ mod track_c_tests {
         let keys = Keys::generate();
         let signed_for_a = "https://host-a.example/git/alice/repo";
         let event_json = git_nip98_event_json(&keys, signed_for_a, "GET");
-        let tenant_a = tenant("host-a.example", 1);
-        let expected_for_a = git_expected_url(
-            "wss://different-config.example",
-            &tenant_a,
-            "/git/alice/repo/git-upload-pack",
-        )
-        .expect("recognized upload-pack path");
+        let origin_a = crate::request_origin::RelayOrigin::parse("wss://host-a.example").unwrap();
+        let expected_for_a = git_expected_url(&origin_a, "/git/alice/repo/git-upload-pack")
+            .expect("recognized upload-pack path");
 
         let pubkey =
             buzz_auth::nip98::verify_nip98_event(&event_json, &expected_for_a, "GET", None)

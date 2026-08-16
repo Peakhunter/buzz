@@ -574,6 +574,11 @@ mod tests {
         config.database_url = TEST_DB_URL.to_string();
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_url = "wss://tenant.example".to_string();
+        config.relay_origin = crate::request_origin::RelayOrigin::parse(&config.relay_url).unwrap();
+        config.accepted_relay_origins = std::collections::HashSet::from([
+            config.relay_origin.clone(),
+            crate::request_origin::RelayOrigin::parse(&format!("ws://{INGRESS_HOST}")).unwrap(),
+        ]);
         config.relay_operator_api_origin = Some(format!("http://{INGRESS_HOST}"));
         config.relay_operator_pubkeys = operator_keys
             .iter()

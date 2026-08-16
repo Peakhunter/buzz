@@ -1,6 +1,7 @@
 //! Relay configuration from environment variables.
 
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -101,6 +102,12 @@ pub struct Config {
     pub db_read_pool_size: Option<u32>,
     /// Public WebSocket URL of this relay, advertised in NIP-11.
     pub relay_url: String,
+    /// Normalized public origin derived from `RELAY_URL`.
+    pub relay_origin: crate::request_origin::RelayOrigin,
+    /// Public origins accepted for request authentication.
+    pub accepted_relay_origins: HashSet<crate::request_origin::RelayOrigin>,
+    /// Socket peers allowed to supply exact forwarded origin headers.
+    pub trusted_proxy_ips: HashSet<IpAddr>,
     /// Public WebSocket URL of the dedicated device-pairing relay, when configured.
     pub pairing_relay_url: Option<String>,
     /// Maximum number of concurrent WebSocket connections.
@@ -296,6 +303,71 @@ pub struct Config {
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
     raw.parse::<SocketAddr>()
         .map_err(|e| ConfigError::InvalidBindAddr(e.to_string()))
+}
+
+fn parse_accepted_relay_origins(
+    raw: &str,
+) -> Result<HashSet<crate::request_origin::RelayOrigin>, ConfigError> {
+    if raw.trim().is_empty() {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_ACCEPTED_RELAY_ORIGINS must not be empty".to_string(),
+        ));
+    }
+    let mut origins = HashSet::new();
+    for value in raw.split(',') {
+        if value.trim() != value || value.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_ACCEPTED_RELAY_ORIGINS contains an empty or padded entry".to_string(),
+            ));
+        }
+        let origin = crate::request_origin::RelayOrigin::parse(value).map_err(|e| {
+            ConfigError::InvalidValue(format!("invalid BUZZ_ACCEPTED_RELAY_ORIGINS: {e}"))
+        })?;
+        if !origins.insert(origin) {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_ACCEPTED_RELAY_ORIGINS contains a duplicate origin".to_string(),
+            ));
+        }
+    }
+    Ok(origins)
+}
+
+fn parse_trusted_proxy_ips(raw: &str) -> Result<HashSet<IpAddr>, ConfigError> {
+    if raw.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut proxies = HashSet::new();
+    for value in raw.split(',') {
+        if value.trim() != value || value.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_TRUSTED_PROXY_IPS contains an empty or padded entry".to_string(),
+            ));
+        }
+        let ip = value.parse::<IpAddr>().map_err(|_| {
+            ConfigError::InvalidValue(
+                "BUZZ_TRUSTED_PROXY_IPS must contain exact IP addresses".to_string(),
+            )
+        })?;
+        if !proxies.insert(ip) {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_TRUSTED_PROXY_IPS contains a duplicate IP".to_string(),
+            ));
+        }
+    }
+    Ok(proxies)
+}
+
+fn validate_relay_origin_is_accepted(
+    relay_origin: &crate::request_origin::RelayOrigin,
+    accepted: &HashSet<crate::request_origin::RelayOrigin>,
+) -> Result<(), ConfigError> {
+    if accepted.contains(relay_origin) {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidValue(
+            "BUZZ_ACCEPTED_RELAY_ORIGINS must include RELAY_URL".to_string(),
+        ))
+    }
 }
 
 fn positive_u64_from_env(name: &str, default: u64) -> Result<u64, ConfigError> {
@@ -533,6 +605,15 @@ impl Config {
 
         let relay_url =
             std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string());
+        let relay_origin = crate::request_origin::RelayOrigin::parse(&relay_url).map_err(|e| {
+            ConfigError::InvalidValue(format!("RELAY_URL must be a bare ws/wss origin: {e}"))
+        })?;
+        let accepted_raw =
+            std::env::var("BUZZ_ACCEPTED_RELAY_ORIGINS").unwrap_or_else(|_| relay_url.clone());
+        let accepted_relay_origins = parse_accepted_relay_origins(&accepted_raw)?;
+        validate_relay_origin_is_accepted(&relay_origin, &accepted_relay_origins)?;
+        let trusted_proxy_ips =
+            parse_trusted_proxy_ips(&std::env::var("BUZZ_TRUSTED_PROXY_IPS").unwrap_or_default())?;
 
         let pairing_relay_url = std::env::var("BUZZ_PAIRING_RELAY_URL")
             .ok()
@@ -997,6 +1078,9 @@ impl Config {
             db_pool_size,
             db_read_pool_size,
             relay_url,
+            relay_origin,
+            accepted_relay_origins,
+            trusted_proxy_ips,
             pairing_relay_url,
             max_connections,
             max_concurrent_handlers,
@@ -1119,6 +1203,8 @@ mod tests {
         assert!(config.max_connections > 0);
         assert!(config.send_buffer_size > 0);
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
+        assert!(config.accepted_relay_origins.contains(&config.relay_origin));
+        assert!(config.trusted_proxy_ips.is_empty());
         assert!(config.slow_client_grace_limit > 0);
         assert!(
             !config.pubkey_allowlist_enabled,
@@ -1157,6 +1243,51 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    #[test]
+    fn relay_origin_lists_are_strict() {
+        let origins = parse_accepted_relay_origins(
+            "ws://buzz.peakhunter.com:3000,wss://buzz.peakhunter.com:8443/",
+        )
+        .expect("valid accepted origins");
+        assert!(origins.contains(
+            &crate::request_origin::RelayOrigin::parse("ws://buzz.peakhunter.com:3000").unwrap()
+        ));
+        for invalid in [
+            "",
+            "ws://a,",
+            "ws://a, wss://b",
+            "https://a",
+            "ws://a/path",
+            "ws://a,ws://a",
+        ] {
+            assert!(
+                parse_accepted_relay_origins(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        let relay = crate::request_origin::RelayOrigin::parse("ws://relay.example").unwrap();
+        assert!(validate_relay_origin_is_accepted(&relay, &origins).is_err());
+
+        assert!(parse_trusted_proxy_ips("").unwrap().is_empty());
+        assert_eq!(
+            parse_trusted_proxy_ips("127.0.0.1,2001:db8::1")
+                .unwrap()
+                .len(),
+            2
+        );
+        for invalid in [
+            "10.0.0.0/8",
+            "proxy.example",
+            "127.0.0.1, 10.0.0.1",
+            "127.0.0.1,127.0.0.1",
+        ] {
+            assert!(
+                parse_trusted_proxy_ips(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]

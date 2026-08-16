@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, RawQuery, State},
+    extract::{Extension, Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Json,
 };
@@ -177,58 +177,17 @@ async fn check_nip98_replay_with_guard(
 
 /// Construct the NIP-98 `u`-tag expected URL for a request bound to `tenant`.
 ///
-/// Conformance row 44 obligation: "NIP-98 `u` URL host must match
-/// `req.community`." Host comes from the resolved [`TenantContext`] — the
-/// same host the row-zero seam already bound from the request `Host` header —
-/// and the scheme comes from the deployment's configured relay URL so
-/// `ws`/`wss` deployments map to `http`/`https` consistently with how the
-/// client signs the URL it is actually hitting.
-///
-/// Critically, this does NOT use `config_relay_url`'s host. `config.relay_url`
-/// is one static string per deployment; under multi-tenant a relay serves many
-/// hosts, only one of which would match. Using it as the URL match key would
-/// (a) accept a NIP-98 event signed for community A's host when the request
-/// arrives at community B's host (host-binding side door — verify_nip98 would
-/// pass and the relay would proceed against the wrong tenant's auth context),
-/// and (b) reject every legitimate request whose community host isn't the
-/// single configured one. Substituting `tenant.host()` closes both directions.
+/// Construct the exact NIP-98 URL from the source-bound request origin.
 pub(crate) fn nip98_expected_url(
-    config_relay_url: &str,
-    tenant: &TenantContext,
+    origin: &crate::request_origin::RelayOrigin,
     path: &str,
 ) -> String {
-    let scheme = if config_relay_url.trim_start().starts_with("wss://") {
-        "https"
-    } else {
-        "http"
-    };
-    format!("{scheme}://{}{path}", tenant.host())
+    origin.http_url(path)
 }
 
-/// Construct the NIP-42 expected `relay` URL for a connection bound to `tenant`.
-///
-/// NIP-42 (WebSocket AUTH) sibling of [`nip98_expected_url`]. Conformance row 44
-/// obligation extends to the WS auth side: the AUTH event's `relay` tag must
-/// match the per-tenant host the connection arrived on, not the deployment-wide
-/// `config.relay_url`. Same hole the NIP-98 fix closed for HTTP — `config.relay_url`
-/// is one static string per deployment, so verifying against it (a) admits an
-/// AUTH event signed against community A's host on a connection bound to
-/// community B (cross-host token reuse), and (b) rejects every legitimate AUTH
-/// whose tenant host isn't the single configured one.
-///
-/// Scheme is `ws`/`wss` (not `http`/`https`) because the value being matched is
-/// the client's connect URL embedded in the signed AUTH event; the helper
-/// preserves the deployment's TLS posture from `config_relay_url`'s prefix so
-/// `wss://` deployments stay `wss://` and `ws://` dev/test stays `ws://`.
-/// Path is empty — clients put the bare WS origin (`ws://host[:port]`) in the
-/// `relay` tag, matching how `EventBuilder::auth` accepts a [`nostr::RelayUrl`].
-pub(crate) fn nip42_expected_relay_url(config_relay_url: &str, tenant: &TenantContext) -> String {
-    let scheme = if config_relay_url.trim_start().starts_with("wss://") {
-        "wss"
-    } else {
-        "ws"
-    };
-    format!("{scheme}://{}", tenant.host())
+/// Construct the exact NIP-42 `relay` value from the connection's request origin.
+pub(crate) fn nip42_expected_relay_url(origin: &crate::request_origin::RelayOrigin) -> String {
+    origin.as_str().to_string()
 }
 
 /// Extract a channel UUID from a single filter's `#h` tag.
@@ -616,6 +575,7 @@ fn truncate_reason(s: &str, max_bytes: usize) -> &str {
 /// Submit a signed Nostr event via HTTP bridge (NIP-98 auth).
 pub async fn submit_event(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<crate::request_origin::RelayOrigin>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -636,7 +596,7 @@ pub async fn submit_event(
             )
         })?;
 
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
+    let url = nip98_expected_url(&relay_origin, "/events");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
@@ -883,6 +843,7 @@ async fn submit_event_authed(
 /// Enforces channel access: results are filtered to channels the user can access.
 pub async fn query_events(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<crate::request_origin::RelayOrigin>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -904,7 +865,7 @@ pub async fn query_events(
             )
         })?;
 
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
+    let url = nip98_expected_url(&relay_origin, "/query");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
@@ -1327,6 +1288,7 @@ async fn query_events_authed(
 /// For filters without a `#h` tag, falls back to per-event counting with access checks.
 pub async fn count_events(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<crate::request_origin::RelayOrigin>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -1347,7 +1309,7 @@ pub async fn count_events(
             )
         })?;
 
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
+    let url = nip98_expected_url(&relay_origin, "/count");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
@@ -2065,6 +2027,7 @@ async fn synthesize_presence(
 /// with what the client signed regardless of param order or encoding.
 async fn authorize_moderation_read(
     state: &Arc<AppState>,
+    relay_origin: &crate::request_origin::RelayOrigin,
     headers: &HeaderMap,
     path: &str,
     raw_query: Option<&str>,
@@ -2086,7 +2049,7 @@ async fn authorize_moderation_read(
         Some(q) if !q.is_empty() => format!("{path}?{q}"),
         _ => path.to_string(),
     };
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
+    let url = nip98_expected_url(relay_origin, &path_with_query);
     let (pubkey, event_id_bytes) =
         verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
     check_nip98_replay(state, &tenant, event_id_bytes).await?;
@@ -2131,12 +2094,14 @@ fn clamp_limit(requested: Option<i64>) -> i64 {
 /// `GET /moderation/reports` — the moderation queue (NIP-98 + mod-authz).
 pub async fn moderation_reports(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<crate::request_origin::RelayOrigin>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Query(q): Query<ModerationReadQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let tenant = authorize_moderation_read(
         &state,
+        &relay_origin,
         &headers,
         "/moderation/reports",
         raw_query.as_deref(),
@@ -2157,13 +2122,19 @@ pub async fn moderation_reports(
 /// `GET /moderation/audit` — the moderation audit log (NIP-98 + mod-authz).
 pub async fn moderation_audit(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<crate::request_origin::RelayOrigin>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Query(q): Query<ModerationReadQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let tenant =
-        authorize_moderation_read(&state, &headers, "/moderation/audit", raw_query.as_deref())
-            .await?;
+    let tenant = authorize_moderation_read(
+        &state,
+        &relay_origin,
+        &headers,
+        "/moderation/audit",
+        raw_query.as_deref(),
+    )
+    .await?;
     let rows = state
         .db
         .list_moderation_actions(tenant.community(), clamp_limit(q.limit))
@@ -2175,10 +2146,17 @@ pub async fn moderation_audit(
 /// `GET /moderation/restricted` — currently banned/timed-out members.
 pub async fn moderation_restricted(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<crate::request_origin::RelayOrigin>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let tenant =
-        authorize_moderation_read(&state, &headers, "/moderation/restricted", None).await?;
+    let tenant = authorize_moderation_read(
+        &state,
+        &relay_origin,
+        &headers,
+        "/moderation/restricted",
+        None,
+    )
+    .await?;
     let rows = state
         .db
         .list_community_restrictions(tenant.community())
@@ -2480,9 +2458,8 @@ mod tests {
         let event_json = build_nip98_event_json(&keys, signed_url, "POST");
         let headers = nip98_auth_headers(&event_json);
 
-        let config_relay_url = "wss://host-a.example"; // doesn't matter — only used for scheme.
-        let tenant_b = fresh_tenant("host-b.example");
-        let expected_url = nip98_expected_url(config_relay_url, &tenant_b, "/events");
+        let origin_b = crate::request_origin::RelayOrigin::parse("wss://host-b.example").unwrap();
+        let expected_url = nip98_expected_url(&origin_b, "/events");
 
         let (status, body) = verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
             .expect_err(
@@ -2546,9 +2523,8 @@ mod tests {
 
         // Configured relay URL deliberately differs in host from the request's
         // tenant host — proving the helper uses `tenant.host()`, not the config.
-        let config_relay_url = "wss://other-config-host.example";
-        let tenant_a = fresh_tenant("host-a.example");
-        let expected_url = nip98_expected_url(config_relay_url, &tenant_a, "/events");
+        let origin_a = crate::request_origin::RelayOrigin::parse("wss://host-a.example").unwrap();
+        let expected_url = nip98_expected_url(&origin_a, "/events");
 
         let (pubkey, _event_id_bytes) =
             verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
@@ -2564,8 +2540,7 @@ mod tests {
     /// before calling [`nip98_expected_url`], so the tests below pin the exact
     /// seam without a DB harness. Kept in lockstep with the production match arm.
     fn moderation_read_expected_url(
-        config_relay_url: &str,
-        tenant: &TenantContext,
+        origin: &crate::request_origin::RelayOrigin,
         path: &str,
         raw_query: Option<&str>,
     ) -> String {
@@ -2573,7 +2548,7 @@ mod tests {
             Some(q) if !q.is_empty() => format!("{path}?{q}"),
             _ => path.to_string(),
         };
-        nip98_expected_url(config_relay_url, tenant, &path_with_query)
+        nip98_expected_url(origin, &path_with_query)
     }
 
     /// L7 read-auth blocker (Wren, #1591 sweep): the CLI signs the *full*
@@ -2591,10 +2566,9 @@ mod tests {
         let event_json = build_nip98_event_json(&keys, signed_url, "GET");
         let headers = nip98_auth_headers(&event_json);
 
-        let tenant_a = fresh_tenant("host-a.example");
+        let origin = crate::request_origin::RelayOrigin::parse("wss://host-a.example").unwrap();
         let expected_url = moderation_read_expected_url(
-            "wss://config-host.example",
-            &tenant_a,
+            &origin,
             "/moderation/reports",
             Some("limit=20&status=open"),
         );
@@ -2616,14 +2590,9 @@ mod tests {
         let event_json = build_nip98_event_json(&keys, signed_url, "GET");
         let headers = nip98_auth_headers(&event_json);
 
-        let tenant_a = fresh_tenant("host-a.example");
+        let origin = crate::request_origin::RelayOrigin::parse("wss://host-a.example").unwrap();
         // No query — the broken pre-fix reconstruction.
-        let bare_url = moderation_read_expected_url(
-            "wss://config-host.example",
-            &tenant_a,
-            "/moderation/reports",
-            None,
-        );
+        let bare_url = moderation_read_expected_url(&origin, "/moderation/reports", None);
 
         let (status, body) = verify_bridge_auth(&headers, "GET", &bare_url, None, true)
             .expect_err("query-signed event MUST NOT match a bare-path expected URL");
@@ -2648,13 +2617,9 @@ mod tests {
         let event_json = build_nip98_event_json(&keys, signed_url, "GET");
         let headers = nip98_auth_headers(&event_json);
 
-        let tenant_a = fresh_tenant("host-a.example");
-        let expected_url = moderation_read_expected_url(
-            "wss://config-host.example",
-            &tenant_a,
-            "/moderation/audit",
-            Some("limit=20"),
-        );
+        let origin = crate::request_origin::RelayOrigin::parse("wss://host-a.example").unwrap();
+        let expected_url =
+            moderation_read_expected_url(&origin, "/moderation/audit", Some("limit=20"));
 
         let (pubkey, _event_id_bytes) =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
@@ -2672,13 +2637,8 @@ mod tests {
         let event_json = build_nip98_event_json(&keys, signed_url, "GET");
         let headers = nip98_auth_headers(&event_json);
 
-        let tenant_a = fresh_tenant("host-a.example");
-        let expected_url = moderation_read_expected_url(
-            "wss://config-host.example",
-            &tenant_a,
-            "/moderation/restricted",
-            None,
-        );
+        let origin = crate::request_origin::RelayOrigin::parse("wss://host-a.example").unwrap();
+        let expected_url = moderation_read_expected_url(&origin, "/moderation/restricted", None);
         assert_eq!(expected_url, "https://host-a.example/moderation/restricted");
 
         let (pubkey, _event_id_bytes) =
@@ -2692,18 +2652,17 @@ mod tests {
     /// changes the output; changing the config's host does NOT.
     #[test]
     fn nip98_expected_url_uses_tenant_host_not_config_host() {
-        let tenant_a = fresh_tenant("host-a.example");
-        let tenant_b = fresh_tenant("host-b.example");
+        let origin_a = crate::request_origin::RelayOrigin::parse("wss://host-a.example").unwrap();
+        let origin_b = crate::request_origin::RelayOrigin::parse("wss://host-b.example").unwrap();
 
-        let url_a = nip98_expected_url("wss://config-host.example", &tenant_a, "/events");
-        let url_b = nip98_expected_url("wss://config-host.example", &tenant_b, "/events");
+        let url_a = nip98_expected_url(&origin_a, "/events");
+        let url_b = nip98_expected_url(&origin_b, "/events");
         assert_eq!(url_a, "https://host-a.example/events");
         assert_eq!(url_b, "https://host-b.example/events");
 
         // Same tenant, two different config hosts → output is identical.
         // (If config-host ever leaked into the URL, this assertion would bite.)
-        let url_a_alt_config =
-            nip98_expected_url("wss://different-config.example", &tenant_a, "/events");
+        let url_a_alt_config = nip98_expected_url(&origin_a, "/events");
         assert_eq!(
             url_a, url_a_alt_config,
             "config-relay-url's host MUST NOT influence the NIP-98 expected URL — \
@@ -2716,14 +2675,15 @@ mod tests {
     /// `ws://` in dev/test still need a NIP-98 URL the client can sign against.
     #[test]
     fn nip98_expected_url_derives_scheme_from_config() {
-        let tenant = fresh_tenant("host-a.example");
+        let secure = crate::request_origin::RelayOrigin::parse("wss://host-a.example").unwrap();
+        let direct = crate::request_origin::RelayOrigin::parse("ws://host-a.example").unwrap();
         assert_eq!(
-            nip98_expected_url("wss://config.example", &tenant, "/events"),
+            nip98_expected_url(&secure, "/events"),
             "https://host-a.example/events",
             "wss:// production config → https:// URL"
         );
         assert_eq!(
-            nip98_expected_url("ws://config.example", &tenant, "/events"),
+            nip98_expected_url(&direct, "/events"),
             "http://host-a.example/events",
             "ws:// dev config → http:// URL"
         );
@@ -2769,10 +2729,10 @@ mod tests {
         // Config URL is A's host (deployment-wide static), and the attacker
         // signs an AUTH event with that same URL. Both are knowable to the
         // attacker. Connection arrived at community B.
-        let config_relay_url = "ws://host-a.example:3100";
         let signed_relay_url = "ws://host-a.example:3100";
-        let tenant_b = fresh_tenant("host-b.example:3100");
-        let expected = nip42_expected_relay_url(config_relay_url, &tenant_b);
+        let origin_b =
+            crate::request_origin::RelayOrigin::parse("ws://host-b.example:3100").unwrap();
+        let expected = nip42_expected_relay_url(&origin_b);
 
         let err = verify_nip42_with_urls(challenge, signed_relay_url, &expected).expect_err(
             "cross-host NIP-42 AUTH event MUST be rejected — row 44 sibling: \
@@ -2796,9 +2756,9 @@ mod tests {
         let signed_relay_url = "ws://host-a.example:3100";
         // Configured relay URL deliberately differs in host from the tenant's
         // host — proving the helper uses `tenant.host()`, not the config.
-        let config_relay_url = "ws://other-config-host.example";
-        let tenant_a = fresh_tenant("host-a.example:3100");
-        let expected = nip42_expected_relay_url(config_relay_url, &tenant_a);
+        let origin_a =
+            crate::request_origin::RelayOrigin::parse("ws://host-a.example:3100").unwrap();
+        let expected = nip42_expected_relay_url(&origin_a);
 
         verify_nip42_with_urls(challenge, signed_relay_url, &expected)
             .expect("matching-host NIP-42 AUTH event must verify");
@@ -2809,18 +2769,20 @@ mod tests {
     /// changes the output; changing the config's host does NOT.
     #[test]
     fn nip42_expected_relay_url_uses_tenant_host_not_config_host() {
-        let tenant_a = fresh_tenant("host-a.example:3100");
-        let tenant_b = fresh_tenant("host-b.example:3100");
+        let origin_a =
+            crate::request_origin::RelayOrigin::parse("ws://host-a.example:3100").unwrap();
+        let origin_b =
+            crate::request_origin::RelayOrigin::parse("ws://host-b.example:3100").unwrap();
 
-        let url_a = nip42_expected_relay_url("ws://config-host.example", &tenant_a);
-        let url_b = nip42_expected_relay_url("ws://config-host.example", &tenant_b);
+        let url_a = nip42_expected_relay_url(&origin_a);
+        let url_b = nip42_expected_relay_url(&origin_b);
         assert_eq!(url_a, "ws://host-a.example:3100");
         assert_eq!(url_b, "ws://host-b.example:3100");
 
         // Same tenant, two different config hosts → output is identical.
         // (If config-host ever leaked into the URL, this assertion would bite —
         // catches the exact "reverted to config host" regression.)
-        let url_a_alt_config = nip42_expected_relay_url("ws://different-config.example", &tenant_a);
+        let url_a_alt_config = nip42_expected_relay_url(&origin_a);
         assert_eq!(
             url_a, url_a_alt_config,
             "config-relay-url's host MUST NOT influence the NIP-42 expected URL — \
@@ -2834,14 +2796,16 @@ mod tests {
     /// tungstenite clients put in the AUTH event's `relay` tag.
     #[test]
     fn nip42_expected_relay_url_derives_scheme_from_config() {
-        let tenant = fresh_tenant("host-a.example:3100");
+        let secure =
+            crate::request_origin::RelayOrigin::parse("wss://host-a.example:3100").unwrap();
+        let direct = crate::request_origin::RelayOrigin::parse("ws://host-a.example:3100").unwrap();
         assert_eq!(
-            nip42_expected_relay_url("wss://config.example", &tenant),
+            nip42_expected_relay_url(&secure),
             "wss://host-a.example:3100",
             "wss:// production config → wss:// URL"
         );
         assert_eq!(
-            nip42_expected_relay_url("ws://config.example", &tenant),
+            nip42_expected_relay_url(&direct),
             "ws://host-a.example:3100",
             "ws:// dev config → ws:// URL"
         );
@@ -3376,6 +3340,9 @@ mod tests {
         config.redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         config.relay_url = "wss://bridge-test.local".to_string();
+        config.relay_origin = crate::request_origin::RelayOrigin::parse(&config.relay_url).unwrap();
+        config.accepted_relay_origins =
+            std::collections::HashSet::from([config.relay_origin.clone()]);
         config.require_auth_token = false;
         config.require_relay_membership = false;
 

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, StatusCode},
     response::{Html, Json},
 };
@@ -229,6 +229,7 @@ pub async fn accept_policy(
 /// signature + replay for `path`.
 async fn authenticate(
     state: &Arc<AppState>,
+    relay_origin: &crate::request_origin::RelayOrigin,
     headers: &HeaderMap,
     path: &str,
     body: &[u8],
@@ -246,7 +247,7 @@ async fn authenticate(
             )
         })?;
 
-    let url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
+    let url = bridge::nip98_expected_url(relay_origin, path);
     let (pubkey, event_id_bytes) = bridge::verify_bridge_auth_with_options(
         headers,
         "POST",
@@ -266,10 +267,12 @@ async fn authenticate(
 /// tenant host.
 pub async fn mint_invite(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<crate::request_origin::RelayOrigin>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (tenant, pubkey) = authenticate(&state, &headers, "/api/invites", &body).await?;
+    let (tenant, pubkey) =
+        authenticate(&state, &relay_origin, &headers, "/api/invites", &body).await?;
 
     // Authz mirrors kind:9030 (add member): owner or admin only.
     let sender_hex = pubkey.to_hex();
@@ -346,10 +349,12 @@ pub async fn mint_invite(
 /// code is never fallen back to v1 verification.
 pub async fn claim_invite(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<crate::request_origin::RelayOrigin>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (tenant, pubkey) = authenticate(&state, &headers, "/api/invites/claim", &body).await?;
+    let (tenant, pubkey) =
+        authenticate(&state, &relay_origin, &headers, "/api/invites/claim", &body).await?;
 
     if claim_rate_limited(&state, tenant.community(), &pubkey) {
         return Err(api_error(
@@ -657,6 +662,9 @@ mod tests {
         config.database_url = database_url.clone();
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_url = format!("wss://{host}");
+        config.relay_origin = crate::request_origin::RelayOrigin::parse(&config.relay_url).unwrap();
+        config.accepted_relay_origins =
+            std::collections::HashSet::from([config.relay_origin.clone()]);
         // The claim route must work on relays where membership is enforced —
         // that is the entire point of an invite.
         config.require_relay_membership = true;

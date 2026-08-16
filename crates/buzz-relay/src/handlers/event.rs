@@ -1385,6 +1385,8 @@ mod tests {
         let conn = Arc::new(crate::connection::ConnectionState {
             conn_id: Uuid::new_v4(),
             tenant: buzz_core::TenantContext::resolved(community_b, "b.example"),
+            relay_origin: crate::request_origin::RelayOrigin::parse("ws://b.example")
+                .expect("valid test origin"),
             remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
             auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
                 buzz_auth::AuthContext {
