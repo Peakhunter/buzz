@@ -314,6 +314,7 @@ fn parse_accepted_relay_origins(
         ));
     }
     let mut origins = HashSet::new();
+    let mut blossom_authorities = HashSet::new();
     for value in raw.split(',') {
         if value.trim() != value || value.is_empty() {
             return Err(ConfigError::InvalidValue(
@@ -323,11 +324,21 @@ fn parse_accepted_relay_origins(
         let origin = crate::request_origin::RelayOrigin::parse(value).map_err(|e| {
             ConfigError::InvalidValue(format!("invalid BUZZ_ACCEPTED_RELAY_ORIGINS: {e}"))
         })?;
-        if !origins.insert(origin) {
+        if origins.contains(&origin) {
             return Err(ConfigError::InvalidValue(
                 "BUZZ_ACCEPTED_RELAY_ORIGINS contains a duplicate origin".to_string(),
             ));
         }
+        // Blossom `server` tags sign only the normalized authority, not the
+        // ws/wss scheme. Distinct accepted origins with the same authority
+        // would therefore make one signed event replayable across both.
+        if !blossom_authorities.insert(origin.authority().to_string()) {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_ACCEPTED_RELAY_ORIGINS contains origins with the same Blossom authority"
+                    .to_string(),
+            ));
+        }
+        origins.insert(origin);
     }
     Ok(origins)
 }

@@ -13,6 +13,20 @@ fn relay_http_url() -> String {
     std::env::var("RELAY_HTTP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string())
 }
 
+fn blossom_server_authority() -> String {
+    let url = reqwest::Url::parse(&relay_http_url()).expect("valid relay HTTP URL");
+    let raw_host = url.host_str().expect("relay URL host");
+    let host = if raw_host.contains(':') && !raw_host.starts_with('[') {
+        format!("[{raw_host}]")
+    } else {
+        raw_host.to_string()
+    };
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
 fn relay_ws_url() -> String {
     relay_http_url()
         .replace("http://", "ws://")
@@ -28,10 +42,12 @@ fn http_client() -> Client {
 
 fn sign_blossom_auth(keys: &Keys, sha256: &str) -> nostr::Event {
     let now = Timestamp::now().as_secs();
+    let server = blossom_server_authority();
     let tags = vec![
         Tag::parse(["t", "upload"]).unwrap(),
         Tag::parse(["x", sha256]).unwrap(),
         Tag::parse(["expiration", &(now + 300).to_string()]).unwrap(),
+        Tag::parse(["server", &server]).unwrap(),
     ];
     EventBuilder::new(Kind::from(24242), "Upload test")
         .tags(tags)
@@ -43,10 +59,12 @@ fn sign_blossom_auth(keys: &Keys, sha256: &str) -> nostr::Event {
 /// unconditionally, so round-trip GETs must present one of these.
 fn sign_blossom_get_auth(keys: &Keys, sha256: &str) -> nostr::Event {
     let now = Timestamp::now().as_secs();
+    let server = blossom_server_authority();
     let tags = vec![
         Tag::parse(["t", "get"]).unwrap(),
         Tag::parse(["x", sha256]).unwrap(),
         Tag::parse(["expiration", &(now + 300).to_string()]).unwrap(),
+        Tag::parse(["server", &server]).unwrap(),
     ];
     EventBuilder::new(Kind::from(24242), "Get test")
         .tags(tags)

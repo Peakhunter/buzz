@@ -203,10 +203,11 @@ pub fn verify_blossom_upload_auth(
 
 /// Verify a kind:24242 Blossom get auth event for one requested blob.
 ///
-/// BUD-01 permits either blob-scoped authorization (`x` tag matches `sha256`)
-/// or server-scoped authorization (`server` tag matches this relay host). The
-/// latter intentionally grants reads for all blobs on the host until expiration;
-/// callers must still apply relay membership after this verifier returns.
+/// BUD-01 permits either blob-scoped authorization (`x` matches `sha256`) or
+/// server-scoped authorization for authority-free library callers. Relay request
+/// paths always supply the resolved external authority, which requires exactly
+/// one matching `server` tag; the optional `x` tag may further scope that token.
+/// Callers must still apply relay membership after this verifier returns.
 pub fn verify_blossom_get_auth(
     auth_event: &nostr::Event,
     sha256: &str,

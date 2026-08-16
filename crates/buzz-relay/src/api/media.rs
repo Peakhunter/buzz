@@ -1288,6 +1288,18 @@ mod tests {
     }
 
     #[test]
+    fn media_base_url_for_tenant_uses_canonical_internal_host() {
+        assert_eq!(
+            media_base_url_for_tenant("wss://config.example", "tenant-b.example"),
+            "https://tenant-b.example/media"
+        );
+        assert_eq!(
+            media_base_url_for_tenant("ws://config.example", "localhost:3100"),
+            "http://localhost:3100/media"
+        );
+    }
+
+    #[test]
     fn rewrite_descriptor_urls_uses_exact_external_origin() {
         let hash = "a".repeat(64);
         let mut descriptor = BlobDescriptor {
