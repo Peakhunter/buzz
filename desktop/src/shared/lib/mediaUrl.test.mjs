@@ -348,6 +348,35 @@ test("rewriteRelayUrl: matches relay origin case-insensitively (uppercase saved 
   }
 });
 
+test("rewriteRelayUrl: proxies the exact legacy plaintext media alias through the active secure relay", async () => {
+  const previousWindow = globalThis.window;
+
+  globalThis.window = {
+    __TAURI_INTERNALS__: {
+      invoke(command) {
+        if (command === "get_media_proxy_port") return Promise.resolve(54321);
+        if (command === "get_relay_http_url") {
+          return Promise.resolve("https://buzz.peakhunter.com:8443");
+        }
+        return Promise.reject(new Error(`Unexpected command: ${command}`));
+      },
+    },
+  };
+
+  try {
+    const mediaUrl = await import(`./mediaUrl.ts?legacyAlias=${Date.now()}`);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const legacyUrl = `http://buzz.peakhunter.com:3000/media/${HASH}.png`;
+    assert.equal(
+      mediaUrl.rewriteRelayUrl(legacyUrl),
+      `http://127.0.0.1:54321/media/${HASH}.png`,
+    );
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
 test("rewriteRelayUrl: still passes external Blossom URLs through unchanged", async () => {
   const previousWindow = globalThis.window;
 
