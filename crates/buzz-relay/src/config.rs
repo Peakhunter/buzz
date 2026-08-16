@@ -1691,6 +1691,19 @@ mod tests {
     }
 
     #[test]
+    fn origin_aliases_preserve_external_scheme_port_and_canonical_authority() {
+        let aliases =
+            parse_origin_aliases("wss://buzz.peakhunter.com:8443=ws://buzz.peakhunter.com:3000")
+                .expect("valid full-origin alias");
+
+        let alias = aliases
+            .get("buzz.peakhunter.com:8443")
+            .expect("alias authority should be the lookup key");
+        assert_eq!(alias.relay_url, "wss://buzz.peakhunter.com:8443");
+        assert_eq!(alias.canonical_authority, "buzz.peakhunter.com:3000");
+    }
+
+    #[test]
     fn host_aliases_parses_one_and_two_pairs() {
         let one = parse_host_aliases("internal.tailnet.example=chat.example.com")
             .expect("single pair should parse");
