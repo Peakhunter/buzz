@@ -122,7 +122,8 @@ pub fn verify_blossom_auth_event_for_verb(
             // client-visible authority. Missing tags are replayable, while
             // multiple tags could deliberately authorize several origins.
             if server_tags.len() != 1
-                || normalize_server_host(server_tags[0]) != normalize_server_host(authority)
+                || normalize_blossom_server_authority(server_tags[0])
+                    != normalize_blossom_server_authority(authority)
             {
                 return Err(MediaError::ServerMismatch);
             }
@@ -163,7 +164,8 @@ pub fn verify_blossom_auth_event(
 /// scheme and path down to the authority, then apply the one shared
 /// [`buzz_core::tenant::normalize_host`] rule so the comparison agrees with how
 /// the WS/HTTP/git doors resolve tenants.
-fn normalize_server_host(value: &str) -> String {
+#[must_use]
+pub fn normalize_blossom_server_authority(value: &str) -> String {
     let authority = match value.split_once("://") {
         Some((_scheme, rest)) => rest.split('/').next().unwrap_or(rest),
         None => value.split('/').next().unwrap_or(value),
@@ -228,12 +230,12 @@ pub fn verify_blossom_get_auth(
 
     let has_matching_server = match server_authority {
         Some(domain) => {
-            let want = normalize_server_host(domain);
+            let want = normalize_blossom_server_authority(domain);
             auth_event.tags.iter().any(|tag| {
                 tag.kind().to_string() == "server"
                     && tag
                         .content()
-                        .map(|value| normalize_server_host(value) == want)
+                        .map(|value| normalize_blossom_server_authority(value) == want)
                         .unwrap_or(false)
             })
         }

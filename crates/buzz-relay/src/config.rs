@@ -332,7 +332,9 @@ fn parse_accepted_relay_origins(
         // Blossom `server` tags sign only the normalized authority, not the
         // ws/wss scheme. Distinct accepted origins with the same authority
         // would therefore make one signed event replayable across both.
-        if !blossom_authorities.insert(origin.authority().to_string()) {
+        let blossom_authority =
+            buzz_media::auth::normalize_blossom_server_authority(origin.authority());
+        if !blossom_authorities.insert(blossom_authority) {
             return Err(ConfigError::InvalidValue(
                 "BUZZ_ACCEPTED_RELAY_ORIGINS contains origins with the same Blossom authority"
                     .to_string(),
