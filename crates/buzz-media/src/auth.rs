@@ -116,22 +116,23 @@ pub fn verify_blossom_auth_event_for_verb(
     //
     // Fail closed: if the expected authority is unavailable, reject tokens that
     // carry server tags rather than silently accepting them.
-    if !server_tags.is_empty() {
-        match server_authority {
-            Some(domain) => {
-                let want = normalize_server_host(domain);
-                let matches = server_tags
-                    .iter()
-                    .any(|tag| normalize_server_host(tag) == want);
-                if !matches {
-                    return Err(MediaError::ServerMismatch);
-                }
-            }
-            None => {
-                // Server tags present but we don't know our own host — reject.
+    match server_authority {
+        Some(authority) => {
+            // Request-bound relay authentication must be scoped to exactly one
+            // client-visible authority. Missing tags are replayable, while
+            // multiple tags could deliberately authorize several origins.
+            if server_tags.len() != 1
+                || normalize_server_host(server_tags[0]) != normalize_server_host(authority)
+            {
                 return Err(MediaError::ServerMismatch);
             }
         }
+        None if !server_tags.is_empty() => {
+            // A caller that cannot supply its expected authority must not accept
+            // an event that claims an unverifiable server scope.
+            return Err(MediaError::ServerMismatch);
+        }
+        None => {}
     }
 
     Ok(())
