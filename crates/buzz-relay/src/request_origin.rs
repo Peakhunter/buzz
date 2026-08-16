@@ -260,6 +260,18 @@ mod tests {
     }
 
     #[test]
+    fn blossom_server_authority_preserves_external_port() {
+        assert_eq!(
+            origin("wss://relay.example:8443").authority(),
+            "relay.example:8443"
+        );
+        assert_eq!(
+            origin("ws://relay.example:3000").authority(),
+            "relay.example:3000"
+        );
+    }
+
+    #[test]
     fn trusted_forwarded_tls_resolves_exact_origin() {
         let mut headers = HeaderMap::new();
         headers.insert(HOST, HeaderValue::from_static("buzz.peakhunter.com:3000"));
