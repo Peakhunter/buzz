@@ -22,6 +22,29 @@ import { invoke } from "@tauri-apps/api/core";
 const RELAY_MEDIA_RE =
   /^(?:https?:\/\/[^/]+)\/media\/([\da-f]{64}(?:\.thumb)?\.(?:jpg|png|gif|webp|mp4|webm|mov)(?:\?.*)?)$/;
 
+/**
+ * Exact, deployment-authorized compatibility aliases for historical signed
+ * media URLs. Keep this list explicit: inferring trust from a shared hostname
+ * would let an unconfigured plaintext port enter the authenticated proxy.
+ */
+const RELAY_MEDIA_ORIGIN_ALIASES = new Map<string, ReadonlySet<string>>([
+  [
+    "https://buzz.peakhunter.com:8443",
+    new Set(["http://buzz.peakhunter.com:3000"]),
+  ],
+]);
+
+function isRelayMediaOrigin(
+  mediaOrigin: string | null,
+  activeRelayOrigin: string,
+): boolean {
+  if (mediaOrigin === null) return false;
+  if (mediaOrigin === activeRelayOrigin) return true;
+  return (
+    RELAY_MEDIA_ORIGIN_ALIASES.get(activeRelayOrigin)?.has(mediaOrigin) ?? false
+  );
+}
+
 /** Cached proxy port — fetched once from the Tauri backend. */
 let cachedPort: number | null = null;
 let portPromise: Promise<number | null> | null = null;
@@ -313,16 +336,16 @@ export function rewriteRelayUrl(url: string): string {
   const m = RELAY_MEDIA_RE.exec(url);
   if (!m) return url;
 
-  // Only proxy URLs that belong to our relay. External Blossom URLs
-  // (different origin) pass through unchanged — they work fine via WKWebView.
+  // Only proxy URLs that belong to our relay or an explicitly authorized
+  // historical media origin. External Blossom URLs pass through unchanged.
   // If the relay origin isn't cached yet, fall through to the rewrite path
   // as a safe default (relay URLs need the proxy to avoid Cloudflare 403s).
-  // Compare canonicalized origins: hosts are case-insensitive, and the relay
-  // always returns lowercased media URLs even when the saved community URL
-  // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
+  // Both the active origin and aliases are canonical URL origins; aliases are
+  // exact pairs rather than same-host inference, so unknown plaintext ports do
+  // not gain access to the authenticated proxy.
   if (cachedRelayOrigin) {
     const urlOrigin = canonicalOrigin(url);
-    if (urlOrigin !== cachedRelayOrigin) {
+    if (!isRelayMediaOrigin(urlOrigin, cachedRelayOrigin)) {
       return url;
     }
   }
