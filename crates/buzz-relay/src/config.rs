@@ -1273,7 +1273,12 @@ mod tests {
             "ws://a/path",
             "ws://a,ws://a",
             "ws://a,wss://a",
+            "ws://a:80,wss://a",
+            "wss://a:443,wss://a",
+            "ws://a.,wss://a",
             "ws://a:8443,wss://a:8443",
+            "ws://[::1]:80,wss://[::1]",
+            "ws://[::1]:8443,wss://[::1]:8443",
         ] {
             assert!(
                 parse_accepted_relay_origins(invalid).is_err(),
