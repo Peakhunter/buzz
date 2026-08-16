@@ -1015,6 +1015,49 @@ mod tests {
         tags
     }
 
+    fn media_upload_auth_header(keys: &Keys, server: &str, sha256: &str) -> String {
+        let expiration = (Timestamp::now().as_secs() + 300).to_string();
+        let event = EventBuilder::new(Kind::from(24242), "Upload media")
+            .tags([
+                Tag::parse(["t", "upload"]).expect("t tag"),
+                Tag::parse(["expiration", &expiration]).expect("expiration tag"),
+                Tag::parse(["server", server]).expect("server tag"),
+                Tag::parse(["x", sha256]).expect("x tag"),
+            ])
+            .sign_with_keys(keys)
+            .expect("sign upload auth");
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(event.as_json().as_bytes())
+        )
+    }
+
+    #[tokio::test]
+    async fn upload_auth_uses_resolved_external_origin_without_changing_tenant_host() {
+        let state = test_state().await;
+        let keys = Keys::generate();
+        let auth = media_upload_auth_header(&keys, "relay.example:8443", VALID_HASH);
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/upload")
+            .header(header::HOST, "relay.example")
+            .header(header::AUTHORIZATION, auth)
+            .header("x-sha-256", VALID_HASH)
+            .body(Body::empty())
+            .expect("request");
+        let (mut parts, _) = request.into_parts();
+        parts.extensions.insert(
+            crate::request_origin::RelayOrigin::parse("wss://relay.example:8443")
+                .expect("external origin"),
+        );
+
+        let upload = AuthenticatedUpload::from_request_parts(&mut parts, &state)
+            .await
+            .expect("external-origin upload auth should pass");
+
+        assert_eq!(upload.tenant.host(), "relay.example");
+    }
+
     fn media_request(method: &str, auth: Option<String>) -> Request<Body> {
         let mut builder = Request::builder()
             .method(method)
