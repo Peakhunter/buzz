@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_get_accepts_matching_x_without_server_tag() {
+    fn test_verify_get_requires_server_tag_when_authority_is_expected() {
         let keys = Keys::generate();
         let sha256 = "a".repeat(64);
         let now = Timestamp::now().as_secs();
@@ -302,7 +302,10 @@ mod tests {
             ],
         );
 
-        assert!(verify_blossom_get_auth(&event, &sha256, Some("relay.example"), 600).is_ok());
+        assert!(matches!(
+            verify_blossom_get_auth(&event, &sha256, Some("relay.example:8443"), 600),
+            Err(MediaError::ServerMismatch)
+        ));
     }
 
     #[test]
@@ -465,12 +468,42 @@ mod tests {
     }
 
     #[test]
-    fn test_no_server_tags_always_passes() {
+    fn test_upload_requires_server_tag_when_authority_is_expected() {
         let keys = Keys::generate();
         let sha256 = "a".repeat(64);
         let event = build_valid_auth(&keys, &sha256);
-        // No server tags → passes regardless of our domain
-        assert!(verify_blossom_upload_auth(&event, &sha256, Some("any.domain.com"), 600).is_ok());
+        assert!(matches!(
+            verify_blossom_upload_auth(&event, &sha256, Some("relay.example:8443"), 600),
+            Err(MediaError::ServerMismatch)
+        ));
+
+        // Library callers without an expected authority retain the BUD-11
+        // optional-server behavior. Relay request paths always supply one.
+        assert!(verify_blossom_upload_auth(&event, &sha256, None, 600).is_ok());
+    }
+
+    #[test]
+    fn test_multiple_server_tags_cannot_authorize_multiple_origins() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let expiration = (Timestamp::now().as_secs() + 300).to_string();
+        let event = EventBuilder::new(Kind::from(24242), "Upload scoped once")
+            .tags([
+                Tag::parse(["t", "upload"]).unwrap(),
+                Tag::parse(["x", &sha256]).unwrap(),
+                Tag::parse(["expiration", &expiration]).unwrap(),
+                Tag::parse(["server", "relay.example:3000"]).unwrap(),
+                Tag::parse(["server", "relay.example:8443"]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        for authority in ["relay.example:3000", "relay.example:8443"] {
+            assert!(matches!(
+                verify_blossom_upload_auth(&event, &sha256, Some(authority), 600),
+                Err(MediaError::ServerMismatch)
+            ));
+        }
     }
 
     /// A `server` tag is matched against the expected relay authority under the
