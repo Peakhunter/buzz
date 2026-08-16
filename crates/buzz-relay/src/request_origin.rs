@@ -45,6 +45,14 @@ impl RelayOrigin {
         &self.0
     }
 
+    /// Return the exact normalized authority used by Blossom `server` tags.
+    pub fn authority(&self) -> &str {
+        self.0
+            .strip_prefix("wss://")
+            .or_else(|| self.0.strip_prefix("ws://"))
+            .expect("RelayOrigin always contains a normalized ws/wss scheme")
+    }
+
     /// Construct the exact HTTP(S) URL used by NIP-98.
     pub fn http_url(&self, path: &str) -> String {
         let scheme = if self.0.starts_with("wss://") {
@@ -52,12 +60,7 @@ impl RelayOrigin {
         } else {
             "http"
         };
-        let authority = self
-            .0
-            .strip_prefix("wss://")
-            .or_else(|| self.0.strip_prefix("ws://"))
-            .unwrap_or(&self.0);
-        format!("{scheme}://{authority}{path}")
+        format!("{scheme}://{}{path}", self.authority())
     }
 }
 
@@ -261,13 +264,18 @@ mod tests {
 
     #[test]
     fn blossom_server_authority_preserves_external_port() {
+        let secure = origin("wss://relay.example:8443");
+        assert_eq!(secure.authority(), "relay.example:8443");
         assert_eq!(
-            origin("wss://relay.example:8443").authority(),
-            "relay.example:8443"
+            secure.http_url("/media"),
+            "https://relay.example:8443/media"
         );
+
+        let plaintext = origin("ws://relay.example:3000");
+        assert_eq!(plaintext.authority(), "relay.example:3000");
         assert_eq!(
-            origin("ws://relay.example:3000").authority(),
-            "relay.example:3000"
+            plaintext.http_url("/media"),
+            "http://relay.example:3000/media"
         );
     }
 

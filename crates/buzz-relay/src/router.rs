@@ -44,6 +44,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(api::media::get_blob).head(api::media::head_blob),
         )
         .layer(RequestBodyLimitLayer::new(media_body_limit))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::request_origin::resolve_origin_middleware,
+        ))
         .with_state(state.clone());
 
     let git_router = api::git::git_router(state.clone()).layer(middleware::from_fn_with_state(
@@ -64,7 +68,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Routes whose signed authentication must bind to the exact client-visible
     // relay origin. Keep this middleware off deployment-global operator/admin,
-    // health, media, webhook, and localhost-only policy routes.
+    // health, webhook, and localhost-only policy routes. Media has the same
+    // resolver on its narrowly scoped sub-router above.
     let origin_api_router = Router::new()
         .route("/events", post(api::bridge::submit_event))
         .route("/query", post(api::bridge::query_events))

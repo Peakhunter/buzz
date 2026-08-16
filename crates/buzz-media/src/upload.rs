@@ -47,6 +47,7 @@ struct BufferedUploadInput<'a> {
     config: &'a MediaConfig,
     ctx: &'a TenantContext,
     auth_event: &'a nostr::Event,
+    server_authority: &'a str,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 }
@@ -66,6 +67,7 @@ where
         config,
         ctx,
         auth_event,
+        server_authority,
         body,
         attribution,
     } = input;
@@ -74,15 +76,12 @@ where
     let auth = auth_event.clone();
     let bytes = body.clone();
     let cfg = config.clone();
-    // Validate the Blossom `server` tag against the host this request was bound
-    // to (the per-request tenant), not a process-global domain — a relay serves
-    // many tenant hosts.
-    let bound_host = ctx.host().to_string();
+    let server_authority = server_authority.to_string();
     let (mime, sha256, ext) = tokio::task::spawn_blocking(move || -> Result<_, MediaError> {
         let (mime, ext) = validate(&bytes, &cfg)?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
         // Buffered uploads (image + file): 10-minute auth window is plenty.
-        verify_blossom_upload_auth(&auth, &sha256, Some(bound_host.as_str()), 600)?;
+        verify_blossom_upload_auth(&auth, &sha256, Some(server_authority.as_str()), 600)?;
         Ok((mime, sha256, ext))
     })
     .await
@@ -209,6 +208,7 @@ pub async fn process_upload(
     config: &MediaConfig,
     ctx: &TenantContext,
     auth_event: &nostr::Event,
+    server_authority: &str,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
@@ -218,6 +218,7 @@ pub async fn process_upload(
             config,
             ctx,
             auth_event,
+            server_authority,
             body,
             attribution,
         },
@@ -247,6 +248,7 @@ pub async fn process_file_upload(
     config: &MediaConfig,
     ctx: &TenantContext,
     auth_event: &nostr::Event,
+    server_authority: &str,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
@@ -256,6 +258,7 @@ pub async fn process_file_upload(
             config,
             ctx,
             auth_event,
+            server_authority,
             body,
             attribution,
         },
@@ -294,6 +297,7 @@ pub async fn process_video_upload(
     config: &MediaConfig,
     ctx: &TenantContext,
     auth_event: &nostr::Event,
+    server_authority: &str,
     body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
     content_length: Option<u64>,
     attribution: Option<UploadAttribution>,
@@ -404,12 +408,15 @@ pub async fn process_video_upload(
     // --- 3. Verify Blossom auth: x tag must match computed SHA-256 ---
     let auth = auth_event.clone();
     let sha256_for_auth = sha256_hex.clone();
-    // Validate the Blossom `server` tag against the bound tenant host (not a
-    // process-global domain) — a relay serves many tenant hosts.
-    let bound_host = ctx.host().to_string();
+    let server_authority = server_authority.to_string();
     tokio::task::spawn_blocking(move || {
         // Videos: 1-hour window — large uploads on slow connections need headroom.
-        verify_blossom_upload_auth(&auth, &sha256_for_auth, Some(bound_host.as_str()), 3600)
+        verify_blossom_upload_auth(
+            &auth,
+            &sha256_for_auth,
+            Some(server_authority.as_str()),
+            3600,
+        )
     })
     .await
     .map_err(|_| MediaError::Internal)??;

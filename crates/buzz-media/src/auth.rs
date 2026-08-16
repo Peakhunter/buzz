@@ -31,7 +31,7 @@ impl BlossomVerb {
 pub fn verify_blossom_auth_event_for_verb(
     auth_event: &nostr::Event,
     verb: BlossomVerb,
-    server_domain: Option<&str>,
+    server_authority: Option<&str>,
     max_age_secs: u64,
 ) -> Result<(), MediaError> {
     // 1. Verify Schnorr signature
@@ -108,19 +108,16 @@ pub fn verify_blossom_auth_event_for_verb(
 
     // 6. Server tag enforcement (BUD-11 §5): if server tags present, our host must appear.
     //
-    // `server_domain` is the host this request was bound to — the per-request
-    // tenant host (`TenantContext::host()`), NOT a single process-global domain.
-    // A relay process serves many tenant hosts; validating against one global
-    // host would 401 every non-primary tenant's server-tagged client (the stock
-    // CLI always tags its configured relay host). Comparison is done under the
-    // shared [`normalize_host`] rule so a tag and the bound host agree by
-    // construction across case, trailing dot, default ports, and an optional
-    // URL scheme/path — exactly as every other host seam resolves tenants.
+    // `server_authority` is the exact client-visible request authority resolved
+    // from source-bound ingress metadata. Tenant/storage selection remains a
+    // separate canonical Host concern in the relay. A process may expose one
+    // tenant through multiple accepted origins, and signatures for distinct
+    // non-default ports must not be interchangeable.
     //
-    // Fail closed: if the bound host is unknown, reject tokens that carry server
-    // tags rather than silently accepting them.
+    // Fail closed: if the expected authority is unavailable, reject tokens that
+    // carry server tags rather than silently accepting them.
     if !server_tags.is_empty() {
-        match server_domain {
+        match server_authority {
             Some(domain) => {
                 let want = normalize_server_host(domain);
                 let matches = server_tags
@@ -146,14 +143,19 @@ pub fn verify_blossom_auth_event_for_verb(
 /// code should prefer [`verify_blossom_auth_event_for_verb`].
 pub fn verify_blossom_auth_event(
     auth_event: &nostr::Event,
-    server_domain: Option<&str>,
+    server_authority: Option<&str>,
     max_age_secs: u64,
 ) -> Result<(), MediaError> {
-    verify_blossom_auth_event_for_verb(auth_event, BlossomVerb::Upload, server_domain, max_age_secs)
+    verify_blossom_auth_event_for_verb(
+        auth_event,
+        BlossomVerb::Upload,
+        server_authority,
+        max_age_secs,
+    )
 }
 
-/// Normalize a Blossom `server` tag value (or a bound tenant host) into the
-/// canonical host form used as the community lookup key.
+/// Normalize a Blossom `server` tag value (or expected relay authority) into the
+/// canonical authority form used for Blossom comparison.
 ///
 /// A `server` tag may be a bare authority (`relay.example:3100`, what the stock
 /// CLI emits) or a full URL (`https://relay.example/`). We strip an optional
@@ -175,13 +177,13 @@ fn normalize_server_host(value: &str) -> String {
 pub fn verify_blossom_upload_auth(
     auth_event: &nostr::Event,
     sha256: &str,
-    server_domain: Option<&str>,
+    server_authority: Option<&str>,
     max_age_secs: u64,
 ) -> Result<(), MediaError> {
     verify_blossom_auth_event_for_verb(
         auth_event,
         BlossomVerb::Upload,
-        server_domain,
+        server_authority,
         max_age_secs,
     )?;
 
@@ -207,17 +209,22 @@ pub fn verify_blossom_upload_auth(
 pub fn verify_blossom_get_auth(
     auth_event: &nostr::Event,
     sha256: &str,
-    server_domain: Option<&str>,
+    server_authority: Option<&str>,
     max_age_secs: u64,
 ) -> Result<(), MediaError> {
-    verify_blossom_auth_event_for_verb(auth_event, BlossomVerb::Get, server_domain, max_age_secs)?;
+    verify_blossom_auth_event_for_verb(
+        auth_event,
+        BlossomVerb::Get,
+        server_authority,
+        max_age_secs,
+    )?;
 
     let has_matching_x = auth_event
         .tags
         .iter()
         .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(sha256)));
 
-    let has_matching_server = match server_domain {
+    let has_matching_server = match server_authority {
         Some(domain) => {
             let want = normalize_server_host(domain);
             auth_event.tags.iter().any(|tag| {
@@ -450,7 +457,7 @@ mod tests {
         assert!(
             verify_blossom_upload_auth(&event, &sha256, Some("other.example.com"), 600).is_ok()
         );
-        // Should fail when server_domain is None — fail closed
+        // Should fail when server_authority is None — fail closed
         assert!(matches!(
             verify_blossom_upload_auth(&event, &sha256, None, 600),
             Err(MediaError::ServerMismatch)
@@ -466,14 +473,13 @@ mod tests {
         assert!(verify_blossom_upload_auth(&event, &sha256, Some("any.domain.com"), 600).is_ok());
     }
 
-    /// A `server` tag is matched against the *bound tenant host* under the
+    /// A `server` tag is matched against the expected relay authority under the
     /// shared `normalize_host` rule, so equivalent host spellings agree — the
     /// stock CLI's bare `host:port`, an explicit default port, a trailing dot,
-    /// mixed case, and a full URL all match the same bound host. This is the
-    /// regression guard for the multi-tenant media blocker: a non-primary
-    /// tenant must accept its own server-tagged client.
+    /// mixed case, and a full URL all match the same expected authority. This
+    /// guards exact non-default-port matching across accepted relay origins.
     #[test]
-    fn test_server_tag_normalized_against_bound_host() {
+    fn test_server_tag_normalized_against_expected_authority() {
         let keys = Keys::generate();
         let sha256 = "a".repeat(64);
         let now = Timestamp::now().as_secs();

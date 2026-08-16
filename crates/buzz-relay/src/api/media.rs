@@ -14,13 +14,14 @@ use axum::{
     extract::{FromRequestParts, Path, State},
     http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use base64::Engine;
 use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::tenant::TenantContext;
 use buzz_media::{BlobDescriptor, MediaError, UploadAttribution, UploadNetworkInfo};
 
+use crate::request_origin::RelayOrigin;
 use crate::state::AppState;
 
 /// Axum extractor that validates Blossom auth, the BUD-11 hash binding, and
@@ -36,6 +37,8 @@ pub(crate) struct AuthenticatedUpload {
     /// this HTTP door), identical to the WS door in `router.rs` and the bridge
     /// door in `bridge.rs`. Server-resolved, never client-supplied.
     tenant: TenantContext,
+    /// Exact client-visible origin resolved from source-bound ingress metadata.
+    relay_origin: RelayOrigin,
     route_mode: UploadRouteMode,
     _upload_permit: UploadPermit,
 }
@@ -145,6 +148,12 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
     ) -> Result<Self, Self::Rejection> {
         let headers = &parts.headers;
 
+        let relay_origin = parts
+            .extensions
+            .get::<RelayOrigin>()
+            .cloned()
+            .ok_or(MediaError::InvalidAuthEvent)?;
+
         // 1. Row zero: bind this upload to its community from the request host,
         // identical to the WS door in `router.rs` and the bridge door in
         // `bridge.rs`. Fail-closed: an unmapped host or lookup failure is a
@@ -152,12 +161,9 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         // host, so an unauthenticated caller cannot probe which communities
         // exist on this deployment.
         //
-        // This MUST run before Blossom auth verification (step 2) so the
-        // `server`-tag check validates against the *bound tenant host*, not a
-        // process-global domain — a relay process serves many tenant hosts, and
-        // the stock CLI tags its own configured relay host (conformance row 52).
-        // Binding only reads the Host header — no request body is buffered — so
-        // doing it first preserves the pre-body auth-rejection guarantee.
+        // Binding only reads canonical Host and no request body. Blossom auth
+        // below uses the independently resolved client-visible origin, while
+        // membership, rate limits, storage, and audit stay tenant-scoped here.
         let raw_host = headers
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
@@ -168,13 +174,18 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
 
         let route_mode = upload_route_mode(parts.uri.path())?;
 
-        // 2. Extract and validate Blossom auth event against the bound host.
+        // 2. Extract and validate Blossom auth against the exact client-visible
+        // authority. Tenant selection remains canonical Host-based above.
         let auth_event = extract_blossom_auth(headers)?;
         // Use the permissive window (3600s) here because we don't know the
         // content type yet.  The upload functions re-verify with the correct
         // per-type window (600s for images, 3600s for video) after the body
         // has been consumed and the SHA-256 computed.
-        buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), 3600)?;
+        buzz_media::auth::verify_blossom_auth_event(
+            &auth_event,
+            Some(relay_origin.authority()),
+            3600,
+        )?;
 
         // 3. Require X-SHA-256 header (BUD-11: mandatory for PUT /upload)
         let claimed_hash = headers
@@ -231,6 +242,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         Ok(AuthenticatedUpload {
             auth_event,
             tenant,
+            relay_origin,
             route_mode,
             _upload_permit: upload_permit,
         })
@@ -346,6 +358,7 @@ pub async fn upload_blob(
             &state.config.media,
             &auth.tenant,
             &auth.auth_event,
+            auth.relay_origin.authority(),
             replay,
             content_length,
             attribution,
@@ -377,6 +390,7 @@ pub async fn upload_blob(
                 &state.config.media,
                 &auth.tenant,
                 &auth.auth_event,
+                auth.relay_origin.authority(),
                 bytes,
                 attribution,
             )
@@ -392,6 +406,7 @@ pub async fn upload_blob(
                 &state.config.media,
                 &auth.tenant,
                 &auth.auth_event,
+                auth.relay_origin.authority(),
                 bytes,
                 attribution,
             )
@@ -399,11 +414,7 @@ pub async fn upload_blob(
         }
     };
 
-    rewrite_descriptor_urls_for_tenant(
-        &mut descriptor,
-        &state.config.relay_url,
-        auth.tenant.host(),
-    );
+    rewrite_descriptor_urls_for_origin(&mut descriptor, &auth.relay_origin);
 
     // Normalize MIME to a known set to bound label cardinality.
     let mime_label = match descriptor.mime_type.as_str() {
@@ -444,6 +455,7 @@ pub async fn upload_blob(
     Ok(Json(descriptor))
 }
 
+/// Canonical media base for internal producers that have no client request.
 pub(crate) fn media_base_url_for_tenant(config_relay_url: &str, tenant_host: &str) -> String {
     let scheme = if config_relay_url.trim_start().starts_with("wss://")
         || config_relay_url.trim_start().starts_with("https://")
@@ -455,12 +467,8 @@ pub(crate) fn media_base_url_for_tenant(config_relay_url: &str, tenant_host: &st
     format!("{scheme}://{tenant_host}/media")
 }
 
-fn rewrite_descriptor_urls_for_tenant(
-    descriptor: &mut BlobDescriptor,
-    config_relay_url: &str,
-    tenant_host: &str,
-) {
-    let base = media_base_url_for_tenant(config_relay_url, tenant_host);
+fn rewrite_descriptor_urls_for_origin(descriptor: &mut BlobDescriptor, relay_origin: &RelayOrigin) {
+    let base = relay_origin.http_url("/media");
     let ext = descriptor
         .url
         .rsplit_once('.')
@@ -490,12 +498,18 @@ async fn authenticate_media_read(
     state: &AppState,
     headers: &HeaderMap,
     sha256_ext: &str,
+    relay_origin: &RelayOrigin,
 ) -> Result<MediaReadAuth, MediaError> {
     let tenant = bind_media_read_tenant(state, headers).await?;
 
     let auth_event = extract_blossom_auth(headers)?;
     let sha256 = sha256_ext.split('.').next().unwrap_or(sha256_ext);
-    buzz_media::auth::verify_blossom_get_auth(&auth_event, sha256, Some(tenant.host()), 3600)?;
+    buzz_media::auth::verify_blossom_get_auth(
+        &auth_event,
+        sha256,
+        Some(relay_origin.authority()),
+        3600,
+    )?;
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
     crate::api::relay_members::enforce_relay_membership(
@@ -595,11 +609,13 @@ const MAX_RANGE_CHUNK: u64 = 16 * 1024 * 1024;
 /// All responses include `Accept-Ranges: bytes` so video players know seeking is supported.
 pub async fn get_blob(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<RelayOrigin>,
     Path(sha256_ext): Path<String>,
     req_headers: HeaderMap,
 ) -> Result<Response, MediaError> {
     validate_media_path(&sha256_ext)?;
-    let media_auth = authenticate_media_read(&state, &req_headers, &sha256_ext).await?;
+    let media_auth =
+        authenticate_media_read(&state, &req_headers, &sha256_ext, &relay_origin).await?;
     serve_blob_for_tenant(&state, &media_auth.tenant, &sha256_ext, &req_headers).await
 }
 
@@ -789,11 +805,12 @@ fn parse_byte_range(range: &str, total: u64) -> Option<(u64, u64)> {
 /// is missing, we return 404 rather than fall back to untrusted metadata.
 pub async fn head_blob(
     State(state): State<Arc<AppState>>,
+    Extension(relay_origin): Extension<RelayOrigin>,
     headers: HeaderMap,
     Path(sha256_ext): Path<String>,
 ) -> Result<Response, MediaError> {
     validate_media_path(&sha256_ext)?;
-    let media_auth = authenticate_media_read(&state, &headers, &sha256_ext).await?;
+    let media_auth = authenticate_media_read(&state, &headers, &sha256_ext, &relay_origin).await?;
     let tenant = media_auth.tenant;
     let cache_control = blob_cache_control();
 
@@ -980,14 +997,19 @@ mod tests {
         Arc::new(state)
     }
 
-    async fn media_get_auth_router() -> axum::Router {
+    async fn media_get_auth_router_for_origin(origin: &str) -> axum::Router {
         let state = test_state().await;
         axum::Router::new()
             .route(
                 "/media/{sha256_ext}",
                 axum::routing::get(get_blob).head(head_blob),
             )
+            .layer(Extension(RelayOrigin::parse(origin).expect("test origin")))
             .with_state(state)
+    }
+
+    async fn media_get_auth_router() -> axum::Router {
+        media_get_auth_router_for_origin("ws://relay.example").await
     }
 
     fn media_get_auth_header(keys: &Keys, tags: Vec<Tag>) -> String {
@@ -1050,6 +1072,28 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn media_get_and_head_bind_auth_to_exact_external_authority() {
+        let keys = Keys::generate();
+        for method in ["GET", "HEAD"] {
+            let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example:8443", None));
+            let response = media_get_auth_router_for_origin("wss://relay.example:8443")
+                .await
+                .oneshot(media_request(method, Some(auth)))
+                .await
+                .expect("external-origin response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+
+            let replay = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
+            let response = media_get_auth_router_for_origin("wss://relay.example:8443")
+                .await
+                .oneshot(media_request(method, Some(replay)))
+                .await
+                .expect("cross-origin response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+        }
     }
 
     #[tokio::test]
@@ -1244,19 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn media_base_url_for_tenant_uses_tenant_host_and_http_scheme() {
-        assert_eq!(
-            media_base_url_for_tenant("wss://config.example", "tenant-b.example"),
-            "https://tenant-b.example/media"
-        );
-        assert_eq!(
-            media_base_url_for_tenant("ws://config.example", "localhost:3100"),
-            "http://localhost:3100/media"
-        );
-    }
-
-    #[test]
-    fn rewrite_descriptor_urls_for_tenant_replaces_global_media_host() {
+    fn rewrite_descriptor_urls_uses_exact_external_origin() {
         let hash = "a".repeat(64);
         let mut descriptor = BlobDescriptor {
             url: format!("https://primary.example/media/{hash}.jpg"),
@@ -1269,20 +1301,19 @@ mod tests {
             thumb: Some(format!("https://primary.example/media/{hash}.thumb.jpg")),
             duration: None,
         };
+        let relay_origin = RelayOrigin::parse("wss://tenant-b.example:8443").unwrap();
 
-        rewrite_descriptor_urls_for_tenant(
-            &mut descriptor,
-            "wss://primary.example",
-            "tenant-b.example",
-        );
+        rewrite_descriptor_urls_for_origin(&mut descriptor, &relay_origin);
 
         assert_eq!(
             descriptor.url,
-            format!("https://tenant-b.example/media/{hash}.jpg")
+            format!("https://tenant-b.example:8443/media/{hash}.jpg")
         );
         assert_eq!(
             descriptor.thumb,
-            Some(format!("https://tenant-b.example/media/{hash}.thumb.jpg"))
+            Some(format!(
+                "https://tenant-b.example:8443/media/{hash}.thumb.jpg"
+            ))
         );
     }
 
