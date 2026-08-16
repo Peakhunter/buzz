@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "build-peakhunter-candidate.sh"
+OUTPUT_HELPER = ROOT / "scripts" / "peakhunter-candidate-output.sh"
 CONFIG = ROOT / "desktop" / "src-tauri" / "tauri.peakhunter.conf.json"
 PLIST = ROOT / "desktop" / "src-tauri" / "Info.peakhunter.plist"
 BUILD_SOURCE = ROOT / "desktop" / "src-tauri" / "build.rs"
@@ -21,7 +23,45 @@ def require(text: str, needle: str) -> None:
         raise AssertionError(f"missing contract fragment: {needle}")
 
 
+def verify_exclusive_output_claim() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        parent = Path(temporary)
+        existing = parent / "existing"
+        existing.mkdir()
+        sentinel = existing / "sentinel"
+        sentinel.write_text("owned elsewhere", encoding="utf-8")
+
+        rejected = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; OUTPUT_ROOT="$2"; claim_output_root',
+                "bash",
+                str(OUTPUT_HELPER),
+                str(existing),
+            ],
+            check=False,
+        )
+        assert rejected.returncode != 0
+        assert sentinel.read_text(encoding="utf-8") == "owned elsewhere"
+
+        claimed = parent / "claimed"
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; OUTPUT_ROOT="$2"; claim_output_root; cleanup_output_root',
+                "bash",
+                str(OUTPUT_HELPER),
+                str(claimed),
+            ],
+            check=True,
+        )
+        assert not claimed.exists()
+
+
 def main() -> None:
+    verify_exclusive_output_claim()
     source_version = json.loads(PACKAGE.read_text(encoding="utf-8"))["version"]
     config = json.loads(CONFIG.read_text(encoding="utf-8"))
     assert config["productName"] == "Buzz Peakhunter"
@@ -59,10 +99,11 @@ def main() -> None:
     require(script, 'OUTPUT_ROOT="$REPO_ROOT/target/peakhunter-candidate/$SOURCE_SHA"')
     require(script, 'git status --porcelain --untracked-files=all')
     require(script, "':!desktop/src-tauri/target'")
-    require(script, 'if [[ "$BUILD_COMPLETE" != true ]]; then')
-    require(script, 'rm -rf "$OUTPUT_ROOT"')
+    require(script, 'source "$REPO_ROOT/scripts/peakhunter-candidate-output.sh"')
+    require(script, "claim_output_root")
+    require(script, "cleanup_output_root")
     assert script.index("trap restore_versions EXIT") < script.index(
-        'mkdir -p "$OUTPUT_ROOT"'
+        "claim_output_root"
     )
     if "/Applications" in script:
         raise AssertionError("candidate builder must never write to /Applications")

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/scripts/peakhunter-candidate-output.sh"
 PRODUCT_NAME="Buzz Peakhunter"
 CANDIDATE_ID="peakhunter"
 BUNDLE_ID="xyz.block.buzz.app.dev.peakhunter"
@@ -40,12 +41,6 @@ SUMS="$OUTPUT_ROOT/SHA256SUMS.txt"
 BUNDLE_MANIFEST="$OUTPUT_ROOT/Buzz_Peakhunter.app.SHA256MANIFEST.txt"
 ENTITLEMENTS="$REPO_ROOT/desktop/src-tauri/Entitlements.plist"
 
-if [[ -e "$OUTPUT_ROOT" ]]; then
-  echo "refusing to overwrite existing immutable candidate: $OUTPUT_ROOT" >&2
-  exit 1
-fi
-BUILD_COMPLETE=false
-
 SIGNING_IDENTITIES=()
 while IFS= read -r identity; do
   [[ -n "$identity" ]] && SIGNING_IDENTITIES+=("$identity")
@@ -68,12 +63,10 @@ VERSION_PATHS=(
 VERSION_PATHS_JSON="$(printf '%s\n' "${VERSION_PATHS[@]}" | python3 -c 'import json, sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin]))')"
 restore_versions() {
   git restore --source=HEAD -- "${VERSION_PATHS[@]}" || true
-  if [[ "$BUILD_COMPLETE" != true ]]; then
-    rm -rf "$OUTPUT_ROOT"
-  fi
+  cleanup_output_root
 }
 trap restore_versions EXIT
-mkdir -p "$OUTPUT_ROOT"
+claim_output_root
 
 (
   cd desktop
