@@ -22,6 +22,29 @@ import { invoke } from "@tauri-apps/api/core";
 const RELAY_MEDIA_RE =
   /^(?:https?:\/\/[^/]+)\/media\/([\da-f]{64}(?:\.thumb)?\.(?:jpg|png|gif|webp|mp4|webm|mov)(?:\?.*)?)$/;
 
+/**
+ * Exact, deployment-authorized compatibility aliases for historical signed
+ * media URLs. Keep this list explicit: inferring trust from a shared hostname
+ * would let an unconfigured plaintext port enter the authenticated proxy.
+ */
+const RELAY_MEDIA_ORIGIN_ALIASES = new Map<string, ReadonlySet<string>>([
+  [
+    "https://buzz.peakhunter.com:8443",
+    new Set(["http://buzz.peakhunter.com:3000"]),
+  ],
+]);
+
+function isRelayMediaOrigin(
+  mediaOrigin: string | null,
+  activeRelayOrigin: string,
+): boolean {
+  if (mediaOrigin === null) return false;
+  if (mediaOrigin === activeRelayOrigin) return true;
+  return (
+    RELAY_MEDIA_ORIGIN_ALIASES.get(activeRelayOrigin)?.has(mediaOrigin) ?? false
+  );
+}
+
 /** Cached proxy port — fetched once from the Tauri backend. */
 let cachedPort: number | null = null;
 let portPromise: Promise<number | null> | null = null;
@@ -322,7 +345,7 @@ export function rewriteRelayUrl(url: string): string {
   // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
   if (cachedRelayOrigin) {
     const urlOrigin = canonicalOrigin(url);
-    if (urlOrigin !== cachedRelayOrigin) {
+    if (!isRelayMediaOrigin(urlOrigin, cachedRelayOrigin)) {
       return url;
     }
   }
