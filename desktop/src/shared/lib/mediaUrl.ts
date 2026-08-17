@@ -349,10 +349,13 @@ export function rewriteRelayUrl(url: string): string {
   // always returns lowercased media URLs even when the saved community URL
   // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
   const urlOrigin = canonicalOrigin(url);
-  if (
-    !cachedRelayOrigin ||
-    !isRelayMediaOrigin(urlOrigin, cachedRelayOrigin)
-  ) {
+  if (!cachedRelayOrigin) {
+    if (!portPromise && typeof window !== "undefined") {
+      ensureRelayOriginFetch();
+    }
+    return url;
+  }
+  if (!isRelayMediaOrigin(urlOrigin, cachedRelayOrigin)) {
     return url;
   }
 
