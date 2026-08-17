@@ -348,6 +348,70 @@ test("rewriteRelayUrl: matches relay origin case-insensitively (uppercase saved 
   }
 });
 
+test("rewriteRelayUrl: proxies the exact legacy plaintext media alias through the active secure relay", async () => {
+  const previousWindow = globalThis.window;
+
+  globalThis.window = {
+    __TAURI_INTERNALS__: {
+      invoke(command) {
+        if (command === "get_media_proxy_port") return Promise.resolve(54321);
+        if (command === "get_relay_http_url") {
+          return Promise.resolve("https://buzz.peakhunter.com:8443");
+        }
+        return Promise.reject(new Error(`Unexpected command: ${command}`));
+      },
+    },
+  };
+
+  try {
+    const mediaUrl = await import(`./mediaUrl.ts?legacyAlias=${Date.now()}`);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const legacyUrl = `http://buzz.peakhunter.com:3000/media/${HASH}.png`;
+    assert.equal(
+      mediaUrl.rewriteRelayUrl(legacyUrl),
+      `http://127.0.0.1:54321/media/${HASH}.png`,
+    );
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test("rewriteRelayUrl: does not broaden the legacy alias to unknown ports, hosts, or non-media paths", async () => {
+  const previousWindow = globalThis.window;
+
+  globalThis.window = {
+    __TAURI_INTERNALS__: {
+      invoke(command) {
+        if (command === "get_media_proxy_port") return Promise.resolve(54321);
+        if (command === "get_relay_http_url") {
+          return Promise.resolve("https://buzz.peakhunter.com:8443");
+        }
+        return Promise.reject(new Error(`Unexpected command: ${command}`));
+      },
+    },
+  };
+
+  try {
+    const mediaUrl = await import(
+      `./mediaUrl.ts?legacyAliasNegative=${Date.now()}`
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const rejected = [
+      `http://buzz.peakhunter.com:3001/media/${HASH}.png`,
+      `http://evil.example:3000/media/${HASH}.png`,
+      `http://buzz.peakhunter.com:3000/admin/${HASH}.png`,
+      `https://buzz.peakhunter.com:3000/media/${HASH}.png`,
+    ];
+    for (const url of rejected) {
+      assert.equal(mediaUrl.rewriteRelayUrl(url), url);
+    }
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
 test("rewriteRelayUrl: still passes external Blossom URLs through unchanged", async () => {
   const previousWindow = globalThis.window;
 
