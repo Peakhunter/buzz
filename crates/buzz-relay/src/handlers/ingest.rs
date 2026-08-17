@@ -2036,7 +2036,8 @@ async fn ingest_event_inner(
     // Product feedback is sidecarred directly into its private deployment table.
     // It never enters ordinary event storage or subscription fan-out.
     if kind_u32 == KIND_PRODUCT_FEEDBACK {
-        super::product_feedback::handle(tenant, &event, state)
+        let media_base = media_base_url_for_ingest(relay_origin);
+        super::product_feedback::handle(tenant, &event, state, &media_base)
             .await
             .map_err(IngestError::Rejected)?;
         // Feedback is a host-resolved, channel-less write. Although its row is
@@ -3045,6 +3046,36 @@ mod tests {
             media_base_url_for_ingest(&origin),
             "https://buzz.peakhunter.com:8443/media"
         );
+    }
+
+    #[test]
+    fn ingest_media_base_accepts_only_its_exact_absolute_imeta_origin() {
+        const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let origin = crate::request_origin::RelayOrigin::parse("wss://buzz.peakhunter.com:8443")
+            .expect("valid public relay origin");
+        let media_base = media_base_url_for_ingest(&origin);
+        let tag_for = |url: String| {
+            vec![
+                "imeta".to_string(),
+                format!("url {url}"),
+                "m image/png".to_string(),
+                format!("x {HASH}"),
+                "size 100".to_string(),
+            ]
+        };
+
+        assert!(crate::api::validate_imeta_tags(
+            &[tag_for(format!("{media_base}/{HASH}.png"))],
+            &media_base,
+        )
+        .is_ok());
+        assert!(crate::api::validate_imeta_tags(
+            &[tag_for(format!(
+                "https://buzz.peakhunter.com:3000/media/{HASH}.png"
+            ))],
+            &media_base,
+        )
+        .is_err());
     }
     use buzz_conformance::{TraceStep, Tracer};
     use buzz_core::kind::{
