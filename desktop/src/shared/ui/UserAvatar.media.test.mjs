@@ -10,6 +10,12 @@ import { UserAvatar } from "./UserAvatar.tsx";
 
 const HASH = "a".repeat(64);
 
+async function flushAvatarImageLifecycle() {
+  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await Promise.resolve();
+}
+
 test("UserAvatar rerenders historical media when relay authorization resolves", async () => {
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
@@ -49,17 +55,25 @@ test("UserAvatar rerenders historical media when relay authorization resolves", 
           testId: "historical-avatar",
         }),
       );
-      await Promise.resolve();
+      await flushAvatarImageLifecycle();
     });
     assert.equal(requestedSources.at(-1), legacyUrl);
+    assert.equal(
+      document
+        .querySelector('[data-testid="historical-avatar-image"]')
+        ?.getAttribute("src"),
+      legacyUrl,
+    );
 
     await act(async () => {
       beginRelayOriginFetch()("https://buzz.peakhunter.com:8443");
-      await Promise.resolve();
+      await flushAvatarImageLifecycle();
     });
 
     assert.equal(
-      requestedSources.at(-1),
+      document
+        .querySelector('[data-testid="historical-avatar-image"]')
+        ?.getAttribute("src"),
       `buzz-media://localhost/media/${HASH}.png`,
     );
   } finally {
