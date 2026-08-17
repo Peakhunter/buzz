@@ -112,6 +112,10 @@ function setRelayOrigin(origin: string | null, generation: number): void {
   if (cachedRelayOrigin === canonical) return;
   cachedRelayOrigin = canonical;
   notifyRelayOriginListeners();
+  // Components that render rewritten media subscribe to the proxy snapshot.
+  // Origin resolution changes whether rewriting is authorized even when the
+  // proxy port itself is unchanged, so they must recalculate here too.
+  notifyMediaProxyPortListeners();
 }
 
 /**
@@ -338,16 +342,18 @@ export function rewriteRelayUrl(url: string): string {
 
   // Only proxy URLs that belong to our relay. External Blossom URLs
   // (different origin) pass through unchanged — they work fine via WKWebView.
-  // If the relay origin isn't cached yet, fall through to the rewrite path
-  // as a safe default (relay URLs need the proxy to avoid Cloudflare 403s).
+  // Fail closed until the selected relay origin is known. Rewriting before
+  // then could route an external or legacy URL through whichever relay is
+  // active. Origin resolution notifies media subscribers so they recalculate.
   // Compare canonicalized origins: hosts are case-insensitive, and the relay
   // always returns lowercased media URLs even when the saved community URL
   // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
-  if (cachedRelayOrigin) {
-    const urlOrigin = canonicalOrigin(url);
-    if (!isRelayMediaOrigin(urlOrigin, cachedRelayOrigin)) {
-      return url;
-    }
+  const urlOrigin = canonicalOrigin(url);
+  if (
+    !cachedRelayOrigin ||
+    !isRelayMediaOrigin(urlOrigin, cachedRelayOrigin)
+  ) {
+    return url;
   }
 
   if (cachedPort && cachedPort > 0) {
