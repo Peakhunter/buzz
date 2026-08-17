@@ -6,6 +6,8 @@ import {
   getCachedRelayOrigin,
   mediaProxyUrl,
   resetMediaCaches,
+  rewriteRelayUrl,
+  subscribeMediaProxyPort,
   subscribeRelayOrigin,
   withDeadline,
 } from "./mediaUrl.ts";
@@ -345,6 +347,31 @@ test("rewriteRelayUrl: matches relay origin case-insensitively (uppercase saved 
     );
   } finally {
     globalThis.window = previousWindow;
+  }
+});
+
+test("rewriteRelayUrl: fails closed until the selected relay origin resolves", () => {
+  resetMediaCaches();
+  let rewriteNotifications = 0;
+  const unsubscribe = subscribeMediaProxyPort(() => rewriteNotifications++);
+  const legacyUrl = `http://buzz.peakhunter.com:3000/media/${HASH}.png`;
+  const externalUrl = `https://nostr.build/media/${HASH}.png`;
+
+  try {
+    assert.equal(rewriteRelayUrl(legacyUrl), legacyUrl);
+    assert.equal(rewriteRelayUrl(externalUrl), externalUrl);
+
+    beginRelayOriginFetch()("https://buzz.peakhunter.com:8443");
+
+    assert.equal(rewriteNotifications, 1);
+    assert.equal(
+      rewriteRelayUrl(legacyUrl),
+      `buzz-media://localhost/media/${HASH}.png`,
+    );
+    assert.equal(rewriteRelayUrl(externalUrl), externalUrl);
+  } finally {
+    unsubscribe();
+    resetMediaCaches();
   }
 });
 
