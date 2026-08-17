@@ -725,7 +725,9 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         conn_id,
     };
 
-    match super::ingest::ingest_event(&state, &conn.tenant, event, ingest_auth).await {
+    match super::ingest::ingest_event(&state, &conn.tenant, &conn.relay_origin, event, ingest_auth)
+        .await
+    {
         Ok(result) => {
             if result.accepted {
                 // buzz_events_stored_total is emitted inside ingest_event()

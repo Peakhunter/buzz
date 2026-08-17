@@ -610,8 +610,16 @@ pub async fn submit_event(
     // runs inside the helper.  The thin wrapper here owns the single terminal
     // attribution line so it fires for every outcome, including admission/
     // replay/membership failures that previously returned before any log fired.
-    let outcome =
-        submit_event_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let outcome = submit_event_authed(
+        &state,
+        &tenant,
+        &relay_origin,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+    )
+    .await;
 
     match &outcome {
         SubmitOutcome::Ok { accepted, .. } => {
@@ -714,6 +722,7 @@ impl SubmitOutcome {
 async fn submit_event_authed(
     state: &Arc<AppState>,
     tenant: &TenantContext,
+    relay_origin: &crate::request_origin::RelayOrigin,
     headers: &HeaderMap,
     body: &[u8],
     pubkey: nostr::PublicKey,
@@ -794,7 +803,7 @@ async fn submit_event_authed(
         auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
     };
 
-    match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {
+    match crate::handlers::ingest::ingest_event(state, tenant, relay_origin, event, auth).await {
         Ok(result) => {
             let response = Json(serde_json::json!({
                 "event_id": result.event_id,
