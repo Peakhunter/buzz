@@ -76,6 +76,26 @@ function canonicalOrigin(url: string): string | null {
 }
 
 /**
+ * Canonicalize an untrusted media URL origin without allowing URL userinfo or
+ * special-scheme backslash parsing to erase a malformed authority boundary.
+ */
+function canonicalMediaOrigin(url: string): string | null {
+  try {
+    const authorityStart = url.indexOf("://") + 3;
+    const authorityEnd = url.indexOf("/", authorityStart);
+    if (authorityStart < 3 || authorityEnd < authorityStart) return null;
+    const rawAuthority = url.slice(authorityStart, authorityEnd);
+    if (!rawAuthority || /[\s@\\?#]/.test(rawAuthority)) return null;
+
+    const parsed = new URL(url);
+    if (parsed.username || parsed.password) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Monotonic cache generation, bumped on every `resetMediaCaches` (i.e.
  * workspace switch). Async lookups capture the current generation and may
  * only publish results while it is still current, so a lookup started for the
@@ -358,7 +378,7 @@ export function rewriteRelayUrl(url: string): string {
   // Compare canonicalized origins: hosts are case-insensitive, and the relay
   // always returns lowercased media URLs even when the saved community URL
   // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
-  const urlOrigin = canonicalOrigin(url);
+  const urlOrigin = canonicalMediaOrigin(url);
   if (!cachedRelayOrigin) {
     if (!portPromise && typeof window !== "undefined") {
       ensureRelayOriginFetch();
