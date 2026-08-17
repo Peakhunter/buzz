@@ -3024,6 +3024,17 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn ingest_media_base_uses_exact_source_bound_public_origin() {
+        let origin = crate::request_origin::RelayOrigin::parse("wss://buzz.peakhunter.com:8443")
+            .expect("valid public relay origin");
+
+        assert_eq!(
+            media_base_url_for_ingest(&origin),
+            "https://buzz.peakhunter.com:8443/media"
+        );
+    }
     use buzz_conformance::{TraceStep, Tracer};
     use buzz_core::kind::{
         KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM,
