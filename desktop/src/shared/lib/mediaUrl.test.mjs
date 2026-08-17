@@ -29,7 +29,7 @@ test("mediaProxyUrl: uses the IPv4 loopback literal for the localhost proxy", ()
   );
 });
 
-test("media-proxy port store: resolved port publishes and reset notifies subscribers", async () => {
+test("media rewrite store: origin, port, and reset notify subscribers", async () => {
   const previousWindow = globalThis.window;
   let notifications = 0;
 
@@ -53,11 +53,11 @@ test("media-proxy port store: resolved port publishes and reset notifies subscri
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     assert.equal(mediaUrl.getCachedMediaProxyPort(), 54321);
-    assert.equal(notifications, 1);
+    assert.equal(notifications, 2);
 
     mediaUrl.resetMediaCaches();
     assert.equal(mediaUrl.getCachedMediaProxyPort(), null);
-    assert.equal(notifications, 2);
+    assert.equal(notifications, 3);
 
     unsubscribe();
   } finally {

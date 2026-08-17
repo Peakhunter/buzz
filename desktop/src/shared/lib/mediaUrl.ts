@@ -289,16 +289,16 @@ if (typeof window !== "undefined") {
  */
 export function resetMediaCaches(): void {
   cacheGeneration += 1;
-  const hadCachedPort = cachedPort !== null;
   cachedPort = null;
   portPromise = null;
-  if (hadCachedPort) {
-    notifyMediaProxyPortListeners();
-  }
   if (cachedRelayOrigin !== null) {
     cachedRelayOrigin = null;
     notifyRelayOriginListeners();
   }
+  // The rewrite snapshot includes the cache generation and relay origin, not
+  // just the port. Always notify so mounted media fails closed immediately on
+  // a community switch, even when the numeric port was already null.
+  notifyMediaProxyPortListeners();
 }
 
 /**
@@ -318,6 +318,16 @@ export function getCachedRelayOrigin(): string | null {
  */
 export function getCachedMediaProxyPort(): number | null {
   return cachedPort;
+}
+
+/**
+ * Stable snapshot for React consumers that render `rewriteRelayUrl()` output.
+ * Any value that can change the rewrite decision must participate so
+ * `useSyncExternalStore` cannot suppress a required rerender merely because
+ * the numeric proxy port stayed the same.
+ */
+export function getMediaRewriteSnapshot(): string {
+  return `${cacheGeneration}:${cachedRelayOrigin ?? ""}:${cachedPort ?? ""}`;
 }
 
 /**
