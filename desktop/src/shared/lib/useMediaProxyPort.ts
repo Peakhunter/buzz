@@ -1,17 +1,22 @@
 import * as React from "react";
 
-import { getCachedMediaProxyPort, subscribeMediaProxyPort } from "./mediaUrl";
+import {
+  getCachedMediaProxyPort,
+  getMediaRewriteSnapshot,
+  subscribeMediaProxyPort,
+} from "./mediaUrl";
 
 /**
- * The resolved localhost media-proxy port, re-rendering when it resolves or
- * changes. Components that call `rewriteRelayUrl` during render can subscribe
- * to this so an initial `buzz-media://` fallback is replaced by the loopback
- * proxy URL as soon as the Tauri backend reports the port.
+ * The resolved localhost media-proxy port, re-rendering whenever the port or
+ * relay-origin authorization changes. Components that call `rewriteRelayUrl`
+ * during render use this to move from fail-closed, to an authorized custom
+ * protocol URL, to the loopback proxy as each dependency resolves.
  */
 export function useMediaProxyPort(): number | null {
-  return React.useSyncExternalStore(
+  React.useSyncExternalStore(
     subscribeMediaProxyPort,
-    getCachedMediaProxyPort,
-    () => null,
+    getMediaRewriteSnapshot,
+    () => "0::",
   );
+  return getCachedMediaProxyPort();
 }

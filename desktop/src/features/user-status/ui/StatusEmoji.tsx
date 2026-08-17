@@ -2,6 +2,7 @@ import { useCustomEmoji } from "@/features/custom-emoji/hooks";
 import { cn } from "@/shared/lib/cn";
 import { emojiDisplayName } from "@/shared/lib/emojiName";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useMediaProxyPort } from "@/shared/lib/useMediaProxyPort";
 
 /**
  * Render a user-status emoji from its stored string. A status emoji is a bare
@@ -26,6 +27,7 @@ type StatusEmojiProps = {
 const SHORTCODE_RE = /^:([^:\s]+):$/;
 
 export function StatusEmoji({ value, className }: StatusEmojiProps) {
+  useMediaProxyPort();
   const customEmoji = useCustomEmoji();
 
   if (!value) return null;

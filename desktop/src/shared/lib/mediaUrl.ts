@@ -22,6 +22,29 @@ import { invoke } from "@tauri-apps/api/core";
 const RELAY_MEDIA_RE =
   /^(?:https?:\/\/[^/]+)\/media\/([\da-f]{64}(?:\.thumb)?\.(?:jpg|png|gif|webp|mp4|webm|mov)(?:\?.*)?)$/;
 
+/**
+ * Exact, deployment-authorized compatibility aliases for historical signed
+ * media URLs. Keep this list explicit: inferring trust from a shared hostname
+ * would let an unconfigured plaintext port enter the authenticated proxy.
+ */
+const RELAY_MEDIA_ORIGIN_ALIASES = new Map<string, ReadonlySet<string>>([
+  [
+    "https://buzz.peakhunter.com:8443",
+    new Set(["http://buzz.peakhunter.com:3000"]),
+  ],
+]);
+
+function isRelayMediaOrigin(
+  mediaOrigin: string | null,
+  activeRelayOrigin: string,
+): boolean {
+  if (mediaOrigin === null) return false;
+  if (mediaOrigin === activeRelayOrigin) return true;
+  return (
+    RELAY_MEDIA_ORIGIN_ALIASES.get(activeRelayOrigin)?.has(mediaOrigin) ?? false
+  );
+}
+
 /** Cached proxy port — fetched once from the Tauri backend. */
 let cachedPort: number | null = null;
 let portPromise: Promise<number | null> | null = null;
@@ -47,6 +70,26 @@ let cachedRelayOrigin: string | null = null;
 function canonicalOrigin(url: string): string | null {
   try {
     return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Canonicalize an untrusted media URL origin without allowing URL userinfo or
+ * special-scheme backslash parsing to erase a malformed authority boundary.
+ */
+function canonicalMediaOrigin(url: string): string | null {
+  try {
+    const authorityStart = url.indexOf("://") + 3;
+    const authorityEnd = url.indexOf("/", authorityStart);
+    if (authorityStart < 3 || authorityEnd < authorityStart) return null;
+    const rawAuthority = url.slice(authorityStart, authorityEnd);
+    if (!rawAuthority || /[\s@\\?#]/.test(rawAuthority)) return null;
+
+    const parsed = new URL(url);
+    if (parsed.username || parsed.password) return null;
+    return parsed.origin;
   } catch {
     return null;
   }
@@ -89,6 +132,10 @@ function setRelayOrigin(origin: string | null, generation: number): void {
   if (cachedRelayOrigin === canonical) return;
   cachedRelayOrigin = canonical;
   notifyRelayOriginListeners();
+  // Components that render rewritten media subscribe to the proxy snapshot.
+  // Origin resolution changes whether rewriting is authorized even when the
+  // proxy port itself is unchanged, so they must recalculate here too.
+  notifyMediaProxyPortListeners();
 }
 
 /**
@@ -262,16 +309,16 @@ if (typeof window !== "undefined") {
  */
 export function resetMediaCaches(): void {
   cacheGeneration += 1;
-  const hadCachedPort = cachedPort !== null;
   cachedPort = null;
   portPromise = null;
-  if (hadCachedPort) {
-    notifyMediaProxyPortListeners();
-  }
   if (cachedRelayOrigin !== null) {
     cachedRelayOrigin = null;
     notifyRelayOriginListeners();
   }
+  // The rewrite snapshot includes the cache generation and relay origin, not
+  // just the port. Always notify so mounted media fails closed immediately on
+  // a community switch, even when the numeric port was already null.
+  notifyMediaProxyPortListeners();
 }
 
 /**
@@ -291,6 +338,16 @@ export function getCachedRelayOrigin(): string | null {
  */
 export function getCachedMediaProxyPort(): number | null {
   return cachedPort;
+}
+
+/**
+ * Stable snapshot for React consumers that render `rewriteRelayUrl()` output.
+ * Any value that can change the rewrite decision must participate so
+ * `useSyncExternalStore` cannot suppress a required rerender merely because
+ * the numeric proxy port stayed the same.
+ */
+export function getMediaRewriteSnapshot(): string {
+  return `${cacheGeneration}:${cachedRelayOrigin ?? ""}:${cachedPort ?? ""}`;
 }
 
 /**
@@ -315,16 +372,21 @@ export function rewriteRelayUrl(url: string): string {
 
   // Only proxy URLs that belong to our relay. External Blossom URLs
   // (different origin) pass through unchanged — they work fine via WKWebView.
-  // If the relay origin isn't cached yet, fall through to the rewrite path
-  // as a safe default (relay URLs need the proxy to avoid Cloudflare 403s).
+  // Fail closed until the selected relay origin is known. Rewriting before
+  // then could route an external or legacy URL through whichever relay is
+  // active. Origin resolution notifies media subscribers so they recalculate.
   // Compare canonicalized origins: hosts are case-insensitive, and the relay
   // always returns lowercased media URLs even when the saved community URL
   // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
-  if (cachedRelayOrigin) {
-    const urlOrigin = canonicalOrigin(url);
-    if (urlOrigin !== cachedRelayOrigin) {
-      return url;
+  const urlOrigin = canonicalMediaOrigin(url);
+  if (!cachedRelayOrigin) {
+    if (!portPromise && typeof window !== "undefined") {
+      ensureRelayOriginFetch();
     }
+    return url;
+  }
+  if (!isRelayMediaOrigin(urlOrigin, cachedRelayOrigin)) {
+    return url;
   }
 
   if (cachedPort && cachedPort > 0) {

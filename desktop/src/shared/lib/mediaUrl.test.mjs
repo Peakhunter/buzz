@@ -6,6 +6,8 @@ import {
   getCachedRelayOrigin,
   mediaProxyUrl,
   resetMediaCaches,
+  rewriteRelayUrl,
+  subscribeMediaProxyPort,
   subscribeRelayOrigin,
   withDeadline,
 } from "./mediaUrl.ts";
@@ -27,9 +29,9 @@ test("mediaProxyUrl: uses the IPv4 loopback literal for the localhost proxy", ()
   );
 });
 
-test("media-proxy port store: resolved port publishes and reset notifies subscribers", async () => {
+test("media rewrite store: port resolution and reset publish new snapshots", async () => {
   const previousWindow = globalThis.window;
-  let notifications = 0;
+  const snapshots = [];
 
   globalThis.window = {
     __TAURI_INTERNALS__: {
@@ -45,17 +47,22 @@ test("media-proxy port store: resolved port publishes and reset notifies subscri
 
   try {
     const mediaUrl = await import(`./mediaUrl.ts?portStore=${Date.now()}`);
-    const unsubscribe = mediaUrl.subscribeMediaProxyPort(() => notifications++);
+    const unsubscribe = mediaUrl.subscribeMediaProxyPort(() =>
+      snapshots.push(mediaUrl.getMediaRewriteSnapshot()),
+    );
 
     mediaUrl.rewriteRelayUrl(`https://relay.example/media/${HASH}.png`);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     assert.equal(mediaUrl.getCachedMediaProxyPort(), 54321);
-    assert.equal(notifications, 1);
+    assert.equal(snapshots.at(-1), mediaUrl.getMediaRewriteSnapshot());
+    assert.match(snapshots.at(-1), /:54321$/);
 
+    const beforeReset = mediaUrl.getMediaRewriteSnapshot();
     mediaUrl.resetMediaCaches();
     assert.equal(mediaUrl.getCachedMediaProxyPort(), null);
-    assert.equal(notifications, 2);
+    assert.notEqual(mediaUrl.getMediaRewriteSnapshot(), beforeReset);
+    assert.equal(snapshots.at(-1), mediaUrl.getMediaRewriteSnapshot());
 
     unsubscribe();
   } finally {
@@ -343,6 +350,98 @@ test("rewriteRelayUrl: matches relay origin case-insensitively (uppercase saved 
       mediaUrl.rewriteRelayUrl(relayMediaUrl),
       `http://127.0.0.1:54321/media/${HASH}.png`,
     );
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test("rewriteRelayUrl: fails closed until the selected relay origin resolves", () => {
+  resetMediaCaches();
+  let rewriteNotifications = 0;
+  const unsubscribe = subscribeMediaProxyPort(() => rewriteNotifications++);
+  const legacyUrl = `http://buzz.peakhunter.com:3000/media/${HASH}.png`;
+  const externalUrl = `https://nostr.build/media/${HASH}.png`;
+
+  try {
+    assert.equal(rewriteRelayUrl(legacyUrl), legacyUrl);
+    assert.equal(rewriteRelayUrl(externalUrl), externalUrl);
+
+    beginRelayOriginFetch()("https://buzz.peakhunter.com:8443");
+
+    assert.equal(rewriteNotifications, 1);
+    assert.equal(
+      rewriteRelayUrl(legacyUrl),
+      `buzz-media://localhost/media/${HASH}.png`,
+    );
+    assert.equal(rewriteRelayUrl(externalUrl), externalUrl);
+  } finally {
+    unsubscribe();
+    resetMediaCaches();
+  }
+});
+
+test("rewriteRelayUrl: proxies the exact legacy plaintext media alias through the active secure relay", async () => {
+  const previousWindow = globalThis.window;
+
+  globalThis.window = {
+    __TAURI_INTERNALS__: {
+      invoke(command) {
+        if (command === "get_media_proxy_port") return Promise.resolve(54321);
+        if (command === "get_relay_http_url") {
+          return Promise.resolve("https://buzz.peakhunter.com:8443");
+        }
+        return Promise.reject(new Error(`Unexpected command: ${command}`));
+      },
+    },
+  };
+
+  try {
+    const mediaUrl = await import(`./mediaUrl.ts?legacyAlias=${Date.now()}`);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const legacyUrl = `http://buzz.peakhunter.com:3000/media/${HASH}.png`;
+    assert.equal(
+      mediaUrl.rewriteRelayUrl(legacyUrl),
+      `http://127.0.0.1:54321/media/${HASH}.png`,
+    );
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test("rewriteRelayUrl: does not broaden the legacy alias to unknown ports, hosts, or non-media paths", async () => {
+  const previousWindow = globalThis.window;
+
+  globalThis.window = {
+    __TAURI_INTERNALS__: {
+      invoke(command) {
+        if (command === "get_media_proxy_port") return Promise.resolve(54321);
+        if (command === "get_relay_http_url") {
+          return Promise.resolve("https://buzz.peakhunter.com:8443");
+        }
+        return Promise.reject(new Error(`Unexpected command: ${command}`));
+      },
+    },
+  };
+
+  try {
+    const mediaUrl = await import(
+      `./mediaUrl.ts?legacyAliasNegative=${Date.now()}`
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const rejected = [
+      `http://buzz.peakhunter.com:3001/media/${HASH}.png`,
+      `http://evil.example:3000/media/${HASH}.png`,
+      `http://buzz.peakhunter.com:3000/admin/${HASH}.png`,
+      `https://buzz.peakhunter.com:3000/media/${HASH}.png`,
+      `http://attacker@buzz.peakhunter.com:3000/media/${HASH}.png`,
+      `http://attacker:secret@buzz.peakhunter.com:3000/media/${HASH}.png`,
+      `http://buzz.peakhunter.com:3000\\@evil.example/media/${HASH}.png`,
+    ];
+    for (const url of rejected) {
+      assert.equal(mediaUrl.rewriteRelayUrl(url), url);
+    }
   } finally {
     globalThis.window = previousWindow;
   }
