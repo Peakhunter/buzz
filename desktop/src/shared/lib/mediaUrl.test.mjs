@@ -435,6 +435,9 @@ test("rewriteRelayUrl: does not broaden the legacy alias to unknown ports, hosts
       `http://evil.example:3000/media/${HASH}.png`,
       `http://buzz.peakhunter.com:3000/admin/${HASH}.png`,
       `https://buzz.peakhunter.com:3000/media/${HASH}.png`,
+      `http://attacker@buzz.peakhunter.com:3000/media/${HASH}.png`,
+      `http://attacker:secret@buzz.peakhunter.com:3000/media/${HASH}.png`,
+      `http://buzz.peakhunter.com:3000\\@evil.example/media/${HASH}.png`,
     ];
     for (const url of rejected) {
       assert.equal(mediaUrl.rewriteRelayUrl(url), url);
