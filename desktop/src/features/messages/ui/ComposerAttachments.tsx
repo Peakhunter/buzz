@@ -16,6 +16,7 @@ import {
 import type { BlobDescriptor } from "@/shared/api/tauri";
 import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useMediaProxyPort } from "@/shared/lib/useMediaProxyPort";
 import {
   shortHash,
   type UploadingAttachmentPreview,
@@ -586,6 +587,7 @@ export const ComposerAttachments = React.memo(function ComposerAttachments({
   onToggleSpoiler,
   spoileredUrls,
 }: ComposerAttachmentsProps) {
+  useMediaProxyPort();
   if (attachments.length === 0 && queuedPreviews.length === 0 && !isUploading)
     return null;
 

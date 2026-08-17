@@ -7,6 +7,7 @@ import { recordQuickReactionEmoji } from "@/features/messages/ui/useQuickReactio
 import { cn } from "@/shared/lib/cn";
 import { emojiDisplayName } from "@/shared/lib/emojiName";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useMediaProxyPort } from "@/shared/lib/useMediaProxyPort";
 import { AnimatedCount } from "@/shared/ui/AnimatedCount";
 import {
   isPositiveEmojiParticle,
@@ -155,6 +156,7 @@ export function MessageReactions({
   burstEmojiOnRender?: string | null;
   onBurstEmojiRendered?: (emoji: string) => void;
 }) {
+  useMediaProxyPort();
   const { burstEmoji } = useEmojiBurst();
   const [pendingBadgeBurstEmoji, setPendingBadgeBurstEmoji] = React.useState<
     string | null

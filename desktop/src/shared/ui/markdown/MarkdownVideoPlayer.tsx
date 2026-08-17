@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useMediaProxyPort } from "@/shared/lib/useMediaProxyPort";
 import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 
 import { VideoPlayer, type VideoReviewContext } from "../VideoPlayer";
@@ -31,6 +32,7 @@ export function MarkdownVideoPlayer({
   resolvedSrc: string;
   src?: string;
 }) {
+  useMediaProxyPort();
   const videoReviewContext = React.useContext(VideoReviewMarkdownContext);
   // Download eligibility is independent of rendering as a video: only a
   // relay-hosted `/media/` URL can pass the native `download_file` SSRF gate,
