@@ -455,18 +455,6 @@ pub async fn upload_blob(
     Ok(Json(descriptor))
 }
 
-/// Canonical media base for internal producers that have no client request.
-pub(crate) fn media_base_url_for_tenant(config_relay_url: &str, tenant_host: &str) -> String {
-    let scheme = if config_relay_url.trim_start().starts_with("wss://")
-        || config_relay_url.trim_start().starts_with("https://")
-    {
-        "https"
-    } else {
-        "http"
-    };
-    format!("{scheme}://{tenant_host}/media")
-}
-
 fn rewrite_descriptor_urls_for_origin(descriptor: &mut BlobDescriptor, relay_origin: &RelayOrigin) {
     let base = relay_origin.http_url("/media");
     let ext = descriptor
@@ -1285,18 +1273,6 @@ mod tests {
         assert!(validate_media_path(&format!("_meta/c/{VALID_HASH}.json")).is_err());
         // Suffix-style metadata keys are also non-servable (>3 segments / bad ext).
         assert!(validate_media_path(&format!("{VALID_HASH}.png.metadata")).is_err());
-    }
-
-    #[test]
-    fn media_base_url_for_tenant_uses_canonical_internal_host() {
-        assert_eq!(
-            media_base_url_for_tenant("wss://config.example", "tenant-b.example"),
-            "https://tenant-b.example/media"
-        );
-        assert_eq!(
-            media_base_url_for_tenant("ws://config.example", "localhost:3100"),
-            "http://localhost:3100/media"
-        );
     }
 
     #[test]

@@ -1863,6 +1863,7 @@ async fn author_type_label(
 pub async fn ingest_event(
     state: &Arc<AppState>,
     tenant: &TenantContext,
+    relay_origin: &crate::request_origin::RelayOrigin,
     event: Event,
     auth: IngestAuth,
 ) -> Result<IngestResult, IngestError> {
@@ -1881,7 +1882,7 @@ pub async fn ingest_event(
         "ingest_event_exited_without_trace",
     );
 
-    let result = ingest_event_inner(state, &tracer, tenant, event, auth).await;
+    let result = ingest_event_inner(state, &tracer, tenant, relay_origin, event, auth).await;
 
     // Fleet-wide stored counter: kind + author_type only, no community tag
     // (see the cardinality rationale on buzz_events_received_total —
@@ -1924,6 +1925,7 @@ async fn ingest_event_inner(
     state: &Arc<AppState>,
     tracer: &Arc<dyn buzz_conformance::Tracer>,
     tenant: &TenantContext,
+    relay_origin: &crate::request_origin::RelayOrigin,
     event: Event,
     auth: IngestAuth,
 ) -> Result<IngestResult, IngestError> {
@@ -2034,7 +2036,8 @@ async fn ingest_event_inner(
     // Product feedback is sidecarred directly into its private deployment table.
     // It never enters ordinary event storage or subscription fan-out.
     if kind_u32 == KIND_PRODUCT_FEEDBACK {
-        super::product_feedback::handle(tenant, &event, state)
+        let media_base = media_base_url_for_ingest(relay_origin);
+        super::product_feedback::handle(tenant, &event, state, &media_base)
             .await
             .map_err(IngestError::Rejected)?;
         // Feedback is a host-resolved, channel-less write. Although its row is
@@ -2713,8 +2716,7 @@ async fn ingest_event_inner(
         });
     }
 
-    let tenant_media_base =
-        crate::api::media::media_base_url_for_tenant(&state.config.relay_url, tenant.host());
+    let tenant_media_base = media_base_url_for_ingest(relay_origin);
     if kind_u32 == KIND_STREAM_MESSAGE {
         validate_link_preview_tags(&event, &tenant_media_base)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
@@ -3019,11 +3021,62 @@ async fn ingest_event_inner(
     })
 }
 
+/// Exact client-visible media base for source-bound event ingestion.
+///
+/// The request origin has already been resolved from trusted ingress metadata
+/// and is also used for NIP-42/NIP-98 verification. Media uploads return URLs on
+/// this origin, so event validation must use the same authority rather than the
+/// canonical backend tenant Host.
+fn media_base_url_for_ingest(relay_origin: &crate::request_origin::RelayOrigin) -> String {
+    relay_origin.http_url("/media")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn ingest_media_base_uses_exact_source_bound_public_origin() {
+        let origin = crate::request_origin::RelayOrigin::parse("wss://buzz.peakhunter.com:8443")
+            .expect("valid public relay origin");
+
+        assert_eq!(
+            media_base_url_for_ingest(&origin),
+            "https://buzz.peakhunter.com:8443/media"
+        );
+    }
+
+    #[test]
+    fn ingest_media_base_accepts_only_its_exact_absolute_imeta_origin() {
+        const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let origin = crate::request_origin::RelayOrigin::parse("wss://buzz.peakhunter.com:8443")
+            .expect("valid public relay origin");
+        let media_base = media_base_url_for_ingest(&origin);
+        let tag_for = |url: String| {
+            vec![
+                "imeta".to_string(),
+                format!("url {url}"),
+                "m image/png".to_string(),
+                format!("x {HASH}"),
+                "size 100".to_string(),
+            ]
+        };
+
+        assert!(crate::api::validate_imeta_tags(
+            &[tag_for(format!("{media_base}/{HASH}.png"))],
+            &media_base,
+        )
+        .is_ok());
+        assert!(crate::api::validate_imeta_tags(
+            &[tag_for(format!(
+                "https://buzz.peakhunter.com:3000/media/{HASH}.png"
+            ))],
+            &media_base,
+        )
+        .is_err());
+    }
     use buzz_conformance::{TraceStep, Tracer};
     use buzz_core::kind::{
         KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM,
