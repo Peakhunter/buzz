@@ -5,84 +5,68 @@ import { JSDOM } from "jsdom";
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 
+import { QuickBotBar } from "./QuickBotBar.tsx";
 import { beginRelayOriginFetch, resetMediaCaches } from "@/shared/lib/mediaUrl";
-import { UserAvatar } from "./UserAvatar.tsx";
+import { TooltipProvider } from "@/shared/ui/tooltip";
 
 const HASH = "a".repeat(64);
 
-async function flushAvatarImageLifecycle() {
-  await Promise.resolve();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  await Promise.resolve();
-}
-
-test("UserAvatar rerenders historical media when relay authorization resolves", async () => {
+test("QuickBotBar rerenders historical media across origin resolution and reset", async () => {
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
-  const previousImage = globalThis.Image;
   const previousActEnvironment = globalThis.IS_REACT_ACT_ENVIRONMENT;
   const dom = new JSDOM(
     "<!doctype html><html><body><div id='root'></div></body></html>",
   );
-  const requestedSources = [];
-
-  class LoadedImage {
-    onload = null;
-    onerror = null;
-
-    set src(value) {
-      requestedSources.push(value);
-      queueMicrotask(() => this.onload?.());
-    }
-  }
-
   globalThis.window = dom.window;
   globalThis.document = dom.window.document;
-  globalThis.Image = LoadedImage;
-  dom.window.Image = LoadedImage;
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   resetMediaCaches();
 
   const legacyUrl = `http://buzz.peakhunter.com:3000/media/${HASH}.png`;
   const root = createRoot(document.getElementById("root"));
   try {
-    await act(async () => {
+    await act(async () =>
       root.render(
-        React.createElement(UserAvatar, {
-          avatarUrl: legacyUrl,
-          displayName: "Historical User",
-          fallbackDelayMs: 0,
-          testId: "historical-avatar",
-        }),
-      );
-      await flushAvatarImageLifecycle();
-    });
-    assert.equal(requestedSources.at(-1), legacyUrl);
-    assert.equal(
-      document
-        .querySelector('[data-testid="historical-avatar-image"]')
-        ?.getAttribute("src"),
-      legacyUrl,
+        React.createElement(
+          TooltipProvider,
+          null,
+          React.createElement(QuickBotBar, {
+            personas: [
+              {
+                persona: {
+                  id: "historical-agent",
+                  displayName: "Historical Agent",
+                  avatarUrl: legacyUrl,
+                },
+                instanceName: "Historical Agent",
+              },
+            ],
+            pending: false,
+            onAdd() {},
+          }),
+        ),
+      ),
     );
+    const image = document.querySelector('img[alt="Historical Agent"]');
+    assert.equal(image?.getAttribute("src"), legacyUrl);
 
     await act(async () => {
       beginRelayOriginFetch()("https://buzz.peakhunter.com:8443");
-      await flushAvatarImageLifecycle();
     });
-
     assert.equal(
-      document
-        .querySelector('[data-testid="historical-avatar-image"]')
-        ?.getAttribute("src"),
+      image?.getAttribute("src"),
       `buzz-media://localhost/media/${HASH}.png`,
     );
+
+    await act(async () => resetMediaCaches());
+    assert.equal(image?.getAttribute("src"), legacyUrl);
   } finally {
     await act(async () => root.unmount());
     resetMediaCaches();
     dom.window.close();
     globalThis.window = previousWindow;
     globalThis.document = previousDocument;
-    globalThis.Image = previousImage;
     globalThis.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
   }
 });
