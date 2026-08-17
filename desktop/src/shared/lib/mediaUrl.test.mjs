@@ -29,9 +29,9 @@ test("mediaProxyUrl: uses the IPv4 loopback literal for the localhost proxy", ()
   );
 });
 
-test("media rewrite store: origin, port, and reset notify subscribers", async () => {
+test("media rewrite store: port resolution and reset publish new snapshots", async () => {
   const previousWindow = globalThis.window;
-  let notifications = 0;
+  const snapshots = [];
 
   globalThis.window = {
     __TAURI_INTERNALS__: {
@@ -47,17 +47,22 @@ test("media rewrite store: origin, port, and reset notify subscribers", async ()
 
   try {
     const mediaUrl = await import(`./mediaUrl.ts?portStore=${Date.now()}`);
-    const unsubscribe = mediaUrl.subscribeMediaProxyPort(() => notifications++);
+    const unsubscribe = mediaUrl.subscribeMediaProxyPort(() =>
+      snapshots.push(mediaUrl.getMediaRewriteSnapshot()),
+    );
 
     mediaUrl.rewriteRelayUrl(`https://relay.example/media/${HASH}.png`);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     assert.equal(mediaUrl.getCachedMediaProxyPort(), 54321);
-    assert.equal(notifications, 2);
+    assert.equal(snapshots.at(-1), mediaUrl.getMediaRewriteSnapshot());
+    assert.match(snapshots.at(-1), /:54321$/);
 
+    const beforeReset = mediaUrl.getMediaRewriteSnapshot();
     mediaUrl.resetMediaCaches();
     assert.equal(mediaUrl.getCachedMediaProxyPort(), null);
-    assert.equal(notifications, 3);
+    assert.notEqual(mediaUrl.getMediaRewriteSnapshot(), beforeReset);
+    assert.equal(snapshots.at(-1), mediaUrl.getMediaRewriteSnapshot());
 
     unsubscribe();
   } finally {
