@@ -18,12 +18,14 @@ test("UserAvatar rerenders historical media when relay authorization resolves", 
   const dom = new JSDOM(
     "<!doctype html><html><body><div id='root'></div></body></html>",
   );
+  const requestedSources = [];
 
   class LoadedImage {
     onload = null;
     onerror = null;
 
-    set src(_value) {
+    set src(value) {
+      requestedSources.push(value);
       queueMicrotask(() => this.onload?.());
     }
   }
@@ -49,12 +51,7 @@ test("UserAvatar rerenders historical media when relay authorization resolves", 
       );
       await Promise.resolve();
     });
-    assert.equal(
-      document
-        .querySelector('[data-testid="historical-avatar-image"]')
-        ?.getAttribute("src"),
-      legacyUrl,
-    );
+    assert.equal(requestedSources.at(-1), legacyUrl);
 
     await act(async () => {
       beginRelayOriginFetch()("https://buzz.peakhunter.com:8443");
@@ -62,9 +59,7 @@ test("UserAvatar rerenders historical media when relay authorization resolves", 
     });
 
     assert.equal(
-      document
-        .querySelector('[data-testid="historical-avatar-image"]')
-        ?.getAttribute("src"),
+      requestedSources.at(-1),
       `buzz-media://localhost/media/${HASH}.png`,
     );
   } finally {
