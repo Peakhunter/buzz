@@ -128,11 +128,41 @@ test("membership discovery unions relay profiles and channel member lists", () =
         { pubkey: PUB_B, channelIds: ["other"] },
       ],
       [
-        { id: "channel-only", memberPubkeys: [PUB_A] },
-        { id: "both", memberPubkeys: [PUB_A, PUB_B] },
+        {
+          id: "relay-only",
+          channelType: "stream",
+          memberPubkeys: [],
+        },
+        {
+          id: "channel-only",
+          channelType: "stream",
+          memberPubkeys: [PUB_A],
+        },
+        {
+          id: "both",
+          channelType: "forum",
+          memberPubkeys: [PUB_A, PUB_B],
+        },
       ],
     ),
     ["both", "channel-only", "relay-only"],
+  );
+});
+
+test("DM participation is preserved instead of sent to channel-member removal", () => {
+  assert.deepEqual(
+    collectExactCleanupChannelIds(
+      PUB_A,
+      [{ pubkey: PUB_A, channelIds: ["direct-message"] }],
+      [
+        {
+          id: "direct-message",
+          channelType: "dm",
+          memberPubkeys: [PUB_A, PUB_B],
+        },
+      ],
+    ),
+    [],
   );
 });
 

@@ -20,7 +20,10 @@ import {
 type ExactStarterAgentCleanupDialogProps = {
   activeRelayUrl: string | null;
   agents: readonly ManagedAgent[];
-  channelsByPubkey: Record<string, { id: string; name: string }[]>;
+  channelsByPubkey: Record<
+    string,
+    { id: string; name: string; channelType?: "stream" | "forum" | "dm" }[]
+  >;
   isPending: boolean;
   onDeleteExact: (pubkey: string) => Promise<boolean>;
   onOpenChange: (open: boolean) => void;
@@ -50,6 +53,12 @@ export function ExactStarterAgentCleanupDialog({
   const selectedMemberships = selected
     ? (channelsByPubkey[normalizePubkey(selected.pubkey)] ?? [])
     : [];
+  const selectedDmMemberships = selectedMemberships.filter(
+    (channel) => channel.channelType === "dm",
+  );
+  const selectedMutableMemberships = selectedMemberships.filter(
+    (channel) => channel.channelType !== "dm",
+  );
 
   React.useEffect(() => {
     if (!open) {
@@ -126,8 +135,10 @@ export function ExactStarterAgentCleanupDialog({
             </div>
             <div className="mt-2 text-xs text-muted-foreground">
               Switch to the identity&apos;s configured community before deleting
-              it when that community still exists. Visible memberships on the
-              current community are removed first; any failure stops deletion.
+              it when that community still exists. Mutable channel memberships
+              on the current community are removed first; any failure stops
+              deletion. DM participation is preserved as signed history and
+              hidden by identity archival instead.
             </div>
             {!activeRelayUrl ? (
               <div className="mt-2 text-xs text-destructive">
@@ -198,12 +209,19 @@ export function ExactStarterAgentCleanupDialog({
                       </div>
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      Visible memberships in the current community:{" "}
-                      <strong>{selectedMemberships.length}</strong>
-                      {selectedMemberships.length > 0
-                        ? ` (${selectedMemberships.map((channel) => channel.name).join(", ")})`
+                      Removable channel memberships in the current community:{" "}
+                      <strong>{selectedMutableMemberships.length}</strong>
+                      {selectedMutableMemberships.length > 0
+                        ? ` (${selectedMutableMemberships.map((channel) => channel.name).join(", ")})`
                         : ""}
                     </div>
+                    {selectedDmMemberships.length > 0 ? (
+                      <div className="text-xs text-muted-foreground">
+                        Preserved DM history:{" "}
+                        <strong>{selectedDmMemberships.length}</strong>
+                        {` (${selectedDmMemberships.map((channel) => channel.name).join(", ")})`}
+                      </div>
+                    ) : null}
                     {selected.cleanupBlockedReason ? (
                       <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-destructive">
                         {selected.cleanupBlockedReason}

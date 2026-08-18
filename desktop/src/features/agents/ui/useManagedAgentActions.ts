@@ -107,7 +107,16 @@ export function useManagedAgentActions() {
   const managedPresenceQuery = usePresenceQuery(managedPubkeyList);
 
   const channelsByPubkey = React.useMemo(() => {
-    const map: Record<string, { id: string; name: string }[]> = {};
+    const channelTypeById = new Map(
+      (channelsQuery.data ?? []).map((channel) => [
+        channel.id,
+        channel.channelType,
+      ]),
+    );
+    const map: Record<
+      string,
+      { id: string; name: string; channelType?: "stream" | "forum" | "dm" }[]
+    > = {};
     // Seed from relay agent profiles (kind:10100 events).
     for (const ra of relayAgentsQuery.data ?? []) {
       if (ra.channels.length > 0) {
@@ -117,7 +126,7 @@ export function useManagedAgentActions() {
         // were an id.
         map[normalizePubkey(ra.pubkey)] = ra.channels.flatMap((name, i) => {
           const id = ra.channelIds[i];
-          return id ? [{ id, name }] : [];
+          return id ? [{ id, name, channelType: channelTypeById.get(id) }] : [];
         });
       }
     }
@@ -132,7 +141,11 @@ export function useManagedAgentActions() {
         if (!normalizedManaged.has(key)) continue;
         if (!map[key]) map[key] = [];
         if (!map[key].some((entry) => entry.id === ch.id)) {
-          map[key].push({ id: ch.id, name: ch.name });
+          map[key].push({
+            id: ch.id,
+            name: ch.name,
+            channelType: ch.channelType,
+          });
         }
       }
     }

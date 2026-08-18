@@ -76,10 +76,15 @@ type RelayMembershipSource = {
 
 type ChannelMembershipSource = {
   id: string;
+  channelType: "stream" | "forum" | "dm";
   memberPubkeys: readonly string[];
 };
 
-/** Union both active-relay membership sources; never resolve an identity by name. */
+/**
+ * Union both active-relay membership sources, but return only mutable
+ * stream/forum memberships. DM participation is immutable signed history and
+ * is hidden by identity archival rather than channel-member removal.
+ */
 export function collectExactCleanupChannelIds(
   targetPubkey: string,
   relayAgents: readonly RelayMembershipSource[],
@@ -87,6 +92,11 @@ export function collectExactCleanupChannelIds(
 ): string[] {
   const normalizedTarget = targetPubkey.trim().toLowerCase();
   const ids = new Set<string>();
+  const dmIds = new Set(
+    channels
+      .filter((channel) => channel.channelType === "dm")
+      .map((channel) => channel.id),
+  );
 
   for (const relayAgent of relayAgents) {
     if (relayAgent.pubkey.trim().toLowerCase() !== normalizedTarget) continue;
@@ -104,7 +114,7 @@ export function collectExactCleanupChannelIds(
     }
   }
 
-  return [...ids].sort();
+  return [...ids].filter((channelId) => !dmIds.has(channelId)).sort();
 }
 
 type ExactStarterAgentDeleteInput = {
@@ -117,7 +127,7 @@ type ExactStarterAgentDeleteInput = {
 
 /**
  * Executes the destructive operation in fail-closed order: fresh membership
- * discovery, owner-signed removals, proof that no visible memberships remain,
+ * discovery, owner-signed removals, proof that no mutable memberships remain,
  * a fresh eligibility read, then the exact backend transaction and exact
  * one-pubkey postcondition. The backend independently revalidates eligibility.
  */
