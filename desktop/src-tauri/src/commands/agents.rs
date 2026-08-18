@@ -160,37 +160,43 @@ pub(super) fn build_agent_archive_request(
 }
 
 /// Durably enqueue the archive request next to the kind:5 tombstone. The flush
-/// loop re-signs it with a relay-fresh timestamp. Best-effort and lock-scoped,
-/// matching `tombstone_managed_agent_pending`.
+/// loop re-signs it with a relay-fresh timestamp.
+fn enqueue_managed_agent_archive(
+    app: &AppHandle,
+    state: &AppState,
+    agent_pubkey: &str,
+    persona_id: Option<&str>,
+) -> Result<(), String> {
+    use crate::managed_agents::retention::{open_retention_db, retain_event, RetainedEvent};
+    use buzz_core_pkg::kind::KIND_IA_ARCHIVE_REQUEST;
+    use nostr::JsonUtil;
+
+    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    let owner_pubkey = scope.owner_keys.public_key().to_hex();
+    let event = build_agent_archive_request(&scope.owner_keys, agent_pubkey, persona_id)?;
+    let conn = open_retention_db(&scope.db_path)?;
+    retain_event(
+        &conn,
+        &RetainedEvent {
+            kind: KIND_IA_ARCHIVE_REQUEST,
+            pubkey: owner_pubkey,
+            d_tag: agent_pubkey.to_string(),
+            content: event.content.to_string(),
+            created_at: event.created_at.as_secs() as i64,
+            raw_event: event.as_json(),
+            pending_sync: true,
+        },
+    )
+}
+
+/// Existing callers retain the historical best-effort behavior.
 pub(super) fn archive_managed_agent_pending(
     app: &AppHandle,
     state: &AppState,
     agent_pubkey: &str,
     persona_id: Option<&str>,
 ) {
-    use crate::managed_agents::retention::{open_retention_db, retain_event, RetainedEvent};
-    use buzz_core_pkg::kind::KIND_IA_ARCHIVE_REQUEST;
-    use nostr::JsonUtil;
-
-    let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let owner_pubkey = scope.owner_keys.public_key().to_hex();
-        let event = build_agent_archive_request(&scope.owner_keys, agent_pubkey, persona_id)?;
-        let conn = open_retention_db(&scope.db_path)?;
-        retain_event(
-            &conn,
-            &RetainedEvent {
-                kind: KIND_IA_ARCHIVE_REQUEST,
-                pubkey: owner_pubkey,
-                d_tag: agent_pubkey.to_string(),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
-        )
-    })();
-    if let Err(e) = result {
+    if let Err(e) = enqueue_managed_agent_archive(app, state, agent_pubkey, persona_id) {
         eprintln!("buzz-desktop: agent-archive: {e}");
     }
 }
@@ -1262,12 +1268,37 @@ pub async fn stop_managed_agent(
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
+fn validate_exact_starter_cleanup(
+    record: &ManagedAgentRecord,
+    runtime_tracked: bool,
+) -> Result<(), String> {
+    const STARTER_PERSONA_IDS: [&str; 3] = ["builtin:fizz", "builtin:honey", "builtin:bumble"];
+
+    if record.backend != BackendKind::Local {
+        return Err("exact starter cleanup only permits local identities".to_string());
+    }
+    let persona_id = record
+        .persona_id
+        .as_deref()
+        .ok_or_else(|| "exact starter cleanup requires a persona id".to_string())?;
+    if !STARTER_PERSONA_IDS.contains(&persona_id) {
+        return Err(format!(
+            "exact starter cleanup does not permit persona {persona_id}"
+        ));
+    }
+    if record.runtime_pid.is_some() || runtime_tracked {
+        return Err("stop this starter identity before exact cleanup".to_string());
+    }
+    Ok(())
+}
+
 // Async so the blocking body (disk reads/writes, process termination, keyring
 // delete, nest regeneration) runs off the main UI thread via spawn_blocking.
 #[tauri::command]
 pub async fn delete_managed_agent(
     pubkey: String,
     force_remote_delete: Option<bool>,
+    exact_starter_cleanup: Option<bool>,
     app: AppHandle,
 ) -> Result<(), String> {
     use tauri::Manager;
@@ -1294,6 +1325,20 @@ pub async fn delete_managed_agent(
             }
             for pubkey in &exited_pubkeys {
                 state.clear_agent_session_caches(pubkey);
+            }
+
+            let strict_cleanup = exact_starter_cleanup.unwrap_or(false);
+            if strict_cleanup {
+                let record = records
+                    .iter()
+                    .find(|record| record.pubkey == pubkey)
+                    .ok_or_else(|| format!("agent {pubkey} not found"))?;
+                let runtime_tracked = runtimes.keys().any(|key| key.pubkey == pubkey);
+                validate_exact_starter_cleanup(record, runtime_tracked)?;
+                // Strict cleanup must durably queue the signed archive request
+                // before the local record or key is removed. A missing active
+                // retention scope is therefore a hard failure.
+                enqueue_managed_agent_archive(&app, &state, &pubkey, record.persona_id.as_deref())?;
             }
 
             // Guard: reject deletion of deployed remote agents unless explicitly forced.
@@ -1334,10 +1379,12 @@ pub async fn delete_managed_agent(
             // deployment's relay record. Inside the lock, before the block closes
             // (no .await here). Every agent published, so every delete tombstones.
             tombstone_managed_agent_pending(&app, &state, &pubkey);
-            // NIP-IA: archive the deleted agent's identity on the relay so it
-            // stops appearing in member pickers and autocomplete. Same
-            // best-effort, inside-the-lock contract as the tombstone above.
-            archive_managed_agent_pending(&app, &state, &pubkey, persona_id.as_deref());
+            // NIP-IA: ordinary deletion preserves its historical best-effort
+            // archive behavior. Strict starter cleanup queued archival before
+            // local record/key removal and therefore skips this duplicate path.
+            if !strict_cleanup {
+                archive_managed_agent_pending(&app, &state, &pubkey, persona_id.as_deref());
+            }
         }
         try_regenerate_nest(&app);
         Ok(())

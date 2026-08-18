@@ -661,3 +661,40 @@ fn owner_only_access_deploy_payload_clamps_stale_access() {
         "owner-only-access deploy payload retained a stale allowlist"
     );
 }
+
+#[test]
+fn exact_starter_cleanup_accepts_only_stopped_local_builtin_instances() {
+    let record = bare_agent_record(Some("builtin:fizz"), None, None);
+    assert!(validate_exact_starter_cleanup(&record, false).is_ok());
+}
+
+#[test]
+fn exact_starter_cleanup_rejects_custom_and_fully_personas() {
+    for persona_id in ["custom:fizz", "custom:fully", "builtin:fully"] {
+        let record = bare_agent_record(Some(persona_id), None, None);
+        let error = validate_exact_starter_cleanup(&record, false).unwrap_err();
+        assert!(error.contains("does not permit persona"));
+    }
+}
+
+#[test]
+fn exact_starter_cleanup_rejects_running_or_tracked_instances() {
+    let mut running = bare_agent_record(Some("builtin:honey"), None, None);
+    running.runtime_pid = Some(42);
+    assert!(validate_exact_starter_cleanup(&running, false).is_err());
+
+    let tracked = bare_agent_record(Some("builtin:bumble"), None, None);
+    assert!(validate_exact_starter_cleanup(&tracked, true).is_err());
+}
+
+#[test]
+fn exact_starter_cleanup_rejects_remote_instances() {
+    use crate::managed_agents::BackendKind;
+
+    let mut record = bare_agent_record(Some("builtin:fizz"), None, None);
+    record.backend = BackendKind::Provider {
+        id: "provider".to_string(),
+        config: serde_json::json!({}),
+    };
+    assert!(validate_exact_starter_cleanup(&record, false).is_err());
+}

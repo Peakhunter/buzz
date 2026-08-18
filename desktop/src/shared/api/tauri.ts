@@ -864,10 +864,12 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
 export async function deleteManagedAgent(
   pubkey: string,
   forceRemoteDelete?: boolean,
+  exactStarterCleanup?: boolean,
 ): Promise<void> {
   await invokeTauri("delete_managed_agent", {
     pubkey,
     forceRemoteDelete: forceRemoteDelete ?? null,
+    exactStarterCleanup: exactStarterCleanup ?? null,
   });
 }
 

@@ -624,10 +624,12 @@ export function useDeleteManagedAgentMutation() {
     mutationFn: ({
       pubkey,
       forceRemoteDelete,
+      exactStarterCleanup,
     }: {
       pubkey: string;
       forceRemoteDelete?: boolean;
-    }) => deleteManagedAgent(pubkey, forceRemoteDelete),
+      exactStarterCleanup?: boolean;
+    }) => deleteManagedAgent(pubkey, forceRemoteDelete, exactStarterCleanup),
     onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey });
       await queryClient.invalidateQueries({ queryKey: relayAgentsQueryKey });

@@ -15,6 +15,7 @@ import {
 } from "@/features/agents/hooks";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useChannelsQuery } from "@/features/channels/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import type { AgentPersona, Channel, ManagedAgent } from "@/shared/api/types";
 import { removeChannelMember } from "@/shared/api/tauri";
@@ -32,9 +33,14 @@ import {
   buildInstanceInputForDefinition,
   resolveStartRuntimeForDefinition,
 } from "../lib/instanceInputForDefinition";
+import {
+  collectExactCleanupChannelIds,
+  deleteExactStarterAgent,
+} from "./exactStarterAgentCleanup";
 
 export function useManagedAgentActions() {
   const { globalConfig } = useGlobalAgentConfig();
+  const { activeCommunity } = useCommunities();
   const relayAgentsQuery = useRelayAgentsQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
   const [shouldLoadChannels, setShouldLoadChannels] = React.useState(false);
@@ -323,6 +329,72 @@ export function useManagedAgentActions() {
     }
   }
 
+  async function handleExactStarterDelete(pubkey: string): Promise<boolean> {
+    clearFeedback();
+    try {
+      await deleteExactStarterAgent({
+        targetPubkey: pubkey,
+        listMembershipChannelIds: async (targetPubkey) => {
+          if (!activeCommunity?.relayUrl) {
+            throw new Error(
+              "Exact cleanup requires an active community so memberships and archival can be verified.",
+            );
+          }
+          const [relayResult, channelsResult] = await Promise.all([
+            relayAgentsQuery.refetch(),
+            channelsQuery.refetch(),
+          ]);
+          if (relayResult.isError || !relayResult.data) {
+            throw new Error(
+              "Could not verify relay-agent memberships. Local deletion was not attempted.",
+            );
+          }
+          if (channelsResult.isError || !channelsResult.data) {
+            throw new Error(
+              "Could not verify channel member lists. Local deletion was not attempted.",
+            );
+          }
+          return collectExactCleanupChannelIds(
+            targetPubkey,
+            relayResult.data,
+            channelsResult.data,
+          );
+        },
+        removeMembership: (channelId, targetPubkey) =>
+          removeChannelMember(channelId, targetPubkey),
+        deleteManagedAgent: (targetPubkey) =>
+          deleteMutation.mutateAsync({
+            pubkey: targetPubkey,
+            exactStarterCleanup: true,
+          }),
+        listManagedAgents: async () => {
+          const refreshed = await managedAgentsQuery.refetch();
+          if (refreshed.isError || !refreshed.data) {
+            throw new Error(
+              "Could not verify the managed identity set. Local deletion was not attempted.",
+            );
+          }
+          return refreshed.data;
+        },
+      });
+
+      setActionNoticeMessage(
+        `Deleted exact starter identity ${pubkey}; archival is queued.`,
+      );
+      if (logAgentPubkey === pubkey) {
+        setLogAgentPubkey(null);
+      }
+      return true;
+    } catch (error) {
+      setActionErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Failed to delete the exact starter identity.",
+      );
+      return false;
+    }
+  }
+
   async function handleToggleStartOnAppLaunch(
     pubkey: string,
     startOnAppLaunch: boolean,
@@ -446,6 +518,7 @@ export function useManagedAgentActions() {
     handleStartPersona,
     handleStop,
     handleDelete,
+    handleExactStarterDelete,
     handleToggleStartOnAppLaunch,
     handleAddedToChannel,
     handleBulkStopRunning,

@@ -1,5 +1,10 @@
 import * as React from "react";
-import { EllipsisVertical, OctagonX, Settings2 } from "lucide-react";
+import {
+  EllipsisVertical,
+  OctagonX,
+  Settings2,
+  ShieldAlert,
+} from "lucide-react";
 import {
   consumePendingSnapshotImport,
   subscribeSnapshotImport,
@@ -7,6 +12,7 @@ import {
 import { AddAgentToChannelDialog } from "./AddAgentToChannelDialog";
 import { AddTeamToChannelDialog } from "./AddTeamToChannelDialog";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
+import { ExactStarterAgentCleanupDialog } from "./ExactStarterAgentCleanupDialog";
 import { AgentDialog } from "./AgentDialog";
 import { PersonaCatalogDialog } from "./PersonaCatalogDialog";
 import { PersonaDeleteDialog } from "./PersonaDeleteDialog";
@@ -25,6 +31,7 @@ import { usePersonaActions } from "./usePersonaActions";
 import { useTeamActions } from "./useTeamActions";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
 import { useBakedBuildEnvQuery } from "@/features/agents/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { Button } from "@/shared/ui/button";
@@ -39,6 +46,7 @@ import { getInheritedAgentDefaults } from "./bakedEnvHelpers";
 
 export function AgentsView() {
   const { openPersonaProfilePanel, openProfilePanel } = useProfilePanel();
+  const { activeCommunity } = useCommunities();
   const { globalConfig } = useGlobalAgentConfig();
   const { data: bakedEnv } = useBakedBuildEnvQuery({ enabled: true });
   const inheritedDefaults = getInheritedAgentDefaults(globalConfig, bakedEnv);
@@ -49,6 +57,7 @@ export function AgentsView() {
   const fullAiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const compactActionsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const [isAiDefaultsOpen, setIsAiDefaultsOpen] = React.useState(false);
+  const [isExactCleanupOpen, setIsExactCleanupOpen] = React.useState(false);
 
   function openUnifiedCatalog() {
     personas.prepareCreate();
@@ -138,6 +147,16 @@ export function AgentsView() {
               <>
                 <div className="flex flex-wrap justify-end gap-2 [@container(max-width:40rem)]:hidden">
                   <Button
+                    data-testid="exact-starter-cleanup-button"
+                    disabled={isActionPending}
+                    onClick={() => setIsExactCleanupOpen(true)}
+                    size="sm"
+                    variant="destructive"
+                  >
+                    <ShieldAlert />
+                    Clean up starter identities
+                  </Button>
+                  <Button
                     data-testid="agent-defaults-button"
                     ref={fullAiDefaultsTriggerRef}
                     onClick={(event) => openAiDefaults(event.currentTarget)}
@@ -179,6 +198,13 @@ export function AgentsView() {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
+                    <DropdownMenuItem
+                      disabled={isActionPending}
+                      onSelect={() => setIsExactCleanupOpen(true)}
+                    >
+                      <ShieldAlert />
+                      Clean up starter identities
+                    </DropdownMenuItem>
                     <DropdownMenuItem
                       onSelect={() => {
                         openAiDefaults(compactActionsTriggerRef.current);
@@ -299,6 +325,16 @@ export function AgentsView() {
         onOpenChange={setAiDefaultsDialogOpen}
         open={isAiDefaultsOpen}
         returnFocusRef={aiDefaultsTriggerRef}
+      />
+
+      <ExactStarterAgentCleanupDialog
+        activeRelayUrl={activeCommunity?.relayUrl ?? null}
+        agents={agents.managedAgents}
+        channelsByPubkey={agents.channelsByPubkey}
+        isPending={agents.isPending}
+        onDeleteExact={agents.handleExactStarterDelete}
+        onOpenChange={setIsExactCleanupOpen}
+        open={isExactCleanupOpen}
       />
 
       {agents.agentToAddToChannel ? (
